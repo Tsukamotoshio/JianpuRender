@@ -96,6 +96,27 @@ interface LinkedSVGDetails {
 type LinkedNoteMap = Map<JianpuNote, LinkedSVGDetails>;
 
 /**
+ * Builds the stable `data-id` for a note's SVG group from its start time and
+ * pitch. `start` is quantized to the same 1e-6 tolerance this codebase
+ * already treats as "the same instant" everywhere else (see e.g.
+ * `JianpuModel.isLastMeasureAtQ()` or the "Fill Rests" comparisons in
+ * `infoToBlocks()`) — without this, a `start` value that arrives at the same
+ * musical position via a different chain of floating-point additions (e.g.
+ * `0.9999999959999997` instead of `1`) produces a *different* id for what is
+ * musically the same note. That breaks two things at once: `redraw(note,
+ * true)` looks up the SVG group by recomputing this same id from a
+ * caller-supplied `NoteInfo`, so any drift between the id computed at draw
+ * time and the id computed at highlight time makes playback highlighting
+ * silently no-op; and consumers that persist ids across re-renders (e.g. for
+ * mouse hit-testing) see a note's identity change even when nothing about
+ * the note itself changed. `pitch` is always an integer MIDI value, so it
+ * never needs quantizing.
+ */
+export function noteElementId(start: number, pitch: number): string {
+  return `${start.toFixed(6)}-${pitch}`;
+}
+
+/**
  * Renders `JianpuInfo` data as numbered musical notation (Jianpu) in an SVG element.
  */
 export class JianpuSVGRender {
@@ -304,7 +325,7 @@ export class JianpuSVGRender {
 
     // --- Highlight Handling ---
     if (activeNote) {
-        const noteId = `${activeNote.start}-${activeNote.pitch}`;
+        const noteId = noteElementId(activeNote.start, activeNote.pitch);
 
         // Deactivate previously playing notes that are not the current one
         this.playingNotes.forEach((_note, id) => { // Changed 'note' to '_note' as it's unused
@@ -548,7 +569,7 @@ private drawNotes(
 
     // Draw notes (potentially a chord)
     block.notes.forEach((note) => { // Removed index as it wasn't used
-        const noteId = `${note.start}-${note.pitch}`;
+        const noteId = noteElementId(note.start, note.pitch);
         // Group for individual note allows highlighting and tie linking
         const noteG = createSVGGroupChild(blockGroup, noteId);
         if (block.isMeasureBeginning()) {
