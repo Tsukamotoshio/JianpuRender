@@ -46,6 +46,10 @@ import {
 
 import { PITCH_CLASS_NAMES } from './model_constants';
 
+import {
+  BeamGroup, beamLevelsBetweenConsecutiveBlocks, computeBeamGroups
+} from './beam_grouping';
+
 
 /**
  * Enumeration of different ways of horizontal score scrolling.
@@ -146,6 +150,16 @@ export class JianpuSVGRender {
   private lastRenderedQ: number; // Track the last quarter note time rendered
   private estimatedNoteWidth: number; // Estimated width of a basic number for spacing
 
+  // Beam grouping (see beam_grouping.ts): which BeamGroup (if any) each block
+  // belongs to, and the x/width anchors recorded so far for each group's
+  // blocks as they get drawn one at a time in time order. A group's merged
+  // beam bar(s) are drawn once its last block's anchor is recorded.
+  // Recomputed fresh on every full `redraw()` call -- see drawJianpuBlock()
+  // for why a group split across two *incremental* redraw calls isn't
+  // handled yet (that path isn't exercised until stage 3.6).
+  private beamGroupByBlock: Map<JianpuBlock, BeamGroup>;
+  private beamGroupAnchors: Map<BeamGroup, Array<{ x: number; width: number }>>;
+
   // Layout & Scaling
   private numberFontSize: number;
   private smallFontSize: number;
@@ -212,6 +226,8 @@ export class JianpuSVGRender {
     this.signaturesBlinking = false;
     this.lastKnownScrollLeft = 0;
     this.isScrolling = false;
+    this.beamGroupByBlock = new Map();
+    this.beamGroupAnchors = new Map();
 
     // Calculate scaling and font sizes based on noteHeight
     this.numberFontSize = this.config.noteHeight * FONT_SIZE_MULTIPLIER;
@@ -377,6 +393,21 @@ export class JianpuSVGRender {
     // --- Incremental Redrawing ---
     else {
         this.jianpuModel.update(this.jianpuInfo, this.config.defaultKey); // Ensure model is up-to-date
+
+        // Recompute beam groups over the *whole* score every full redraw (see
+        // beam_grouping.ts). This only covers the "draw everything in one
+        // pass" usage this class's own incremental loop below already
+        // assumes elsewhere (lastRenderedQ starts at -1 and a fresh instance
+        // is what stage 3.2's SumisoraOMR integration actually creates per
+        // render) -- a group whose blocks straddle two separate *partial*
+        // redraw calls isn't reconciled here.
+        const allBlocksInOrder = Array.from(this.jianpuModel.jianpuBlockMap.values());
+        const beamGroups = computeBeamGroups(allBlocksInOrder, this.jianpuModel.measuresInfo);
+        this.beamGroupByBlock = new Map();
+        for (const group of beamGroups) {
+            for (const block of group.blocks) this.beamGroupByBlock.set(block, group);
+        }
+        this.beamGroupAnchors = new Map();
 
         let currentX = this.width; // Start drawing from the end of previous content
         let contentWidth = this.width;
@@ -641,12 +672,17 @@ private drawNotes(
         }
 
 
-        // --- Duration Underlines ---
-        if (durationLines > 0) {
+        // --- Duration Underlines (or, if this block is beamed with its
+        // neighbours, defer to a single merged bar drawn once the whole
+        // group has been recorded -- see beam_grouping.ts / drawBeamGroup) ---
+        const beamGroup = this.beamGroupByBlock.get(block);
+        if (beamGroup) {
+            this.recordBeamAnchorAndMaybeDraw(beamGroup, block, noteStartX, noteWidth);
+        } else if (durationLines > 0) {
             const lineYOffset = this.config.noteHeight * UNDERLINE_SPACING_FACTOR * 2.5;
             const lineSpacing = this.config.noteHeight * UNDERLINE_SPACING_FACTOR;
             const lineWidthScale = noteWidth / PATH_SCALE * (DURATION_LINE_SCALES.get(durationLines) ?? 1);
-            
+
             for (let lineIndex = 0; lineIndex < durationLines; lineIndex++) {
                 const yPosition = lineYOffset + lineIndex * lineSpacing;
                 const durationLine = drawSVGPath(noteG, underlinePath, noteStartX, yPosition, lineWidthScale, 1);
@@ -726,6 +762,76 @@ private drawNotes(
     }); // End forEach note
 
     return maxX - x; // Return the width of the content drawn
+}
+
+/**
+ * Records a beamed block's note anchor (x position + width) for its
+ * BeamGroup, and once every block in the group has been recorded (i.e.
+ * this was the last one drawn), draws the group's merged beam bar(s) and
+ * discards the group's bookkeeping.
+ */
+private recordBeamAnchorAndMaybeDraw(
+    group: BeamGroup, block: JianpuBlock, noteStartX: number, noteWidth: number
+): void {
+    const anchors = this.beamGroupAnchors.get(group) ?? [];
+    anchors.push({ x: noteStartX, width: noteWidth });
+    this.beamGroupAnchors.set(group, anchors);
+    if (anchors.length === group.blocks.length) {
+        this.drawBeamGroup(group, anchors);
+        this.beamGroupAnchors.delete(group);
+    }
+}
+
+/**
+ * Draws a beamed group's merged underline bar(s), replacing what would
+ * otherwise be each block's own independent underline (see the "Duration
+ * Underlines" branch in drawNotes()). Mirrors the standard multi-level
+ * ("secondary"/partial) beam convention: level 1 spans the whole group
+ * (always true here -- every block in a BeamGroup has durationLines >= 1
+ * by construction, see computeBeamGroups()), and each higher level spans
+ * only the maximal runs of *adjacent* blocks that both need that many
+ * beams, with a short "hook" stub for an isolated block that needs more
+ * beams than its neighbour(s) at that level.
+ *
+ * Hook direction is a deliberate simplification (points toward whichever
+ * neighbour exists in the group, preferring forward): the stage 3.4
+ * acceptance test is a uniform run of same-duration notes, which never
+ * produces a hook, so treat this specific branch as unverified until it's
+ * checked against a real mixed-duration file.
+ */
+private drawBeamGroup(group: BeamGroup, anchors: Array<{ x: number; width: number }>): void {
+    const lineYOffset = this.config.noteHeight * UNDERLINE_SPACING_FACTOR * 2.5;
+    const lineSpacing = this.config.noteHeight * UNDERLINE_SPACING_FACTOR;
+    const hookLength = this.estimatedNoteWidth * 0.6;
+
+    const drawSegment = (level: number, xStart: number, xEnd: number) => {
+        const yPosition = lineYOffset + (level - 1) * lineSpacing;
+        const widthScale = (xEnd - xStart) / PATH_SCALE;
+        const line = drawSVGPath(this.musicG, underlinePath, xStart, yPosition, widthScale, 1);
+        setStroke(line, this.config.noteColor, LINE_STROKE_WIDTH);
+    };
+
+    const nBeams = group.blocks.map((b) => b.durationLines ?? 0);
+    const maxLevel = Math.max(...nBeams);
+    const connectLevels = beamLevelsBetweenConsecutiveBlocks(group); // length === blocks.length; last entry is always 0
+
+    for (let level = 1; level <= maxLevel; level++) {
+        let i = 0;
+        while (i < nBeams.length) {
+            if (nBeams[i] < level) { i++; continue; }
+            let j = i;
+            while (j < nBeams.length - 1 && connectLevels[j] >= level) j++;
+            if (j > i) {
+                drawSegment(level, anchors[i].x, anchors[j].x + anchors[j].width);
+                i = j + 1;
+            } else {
+                const hasNext = i < anchors.length - 1;
+                if (hasNext) drawSegment(level, anchors[i].x, anchors[i].x + hookLength);
+                else drawSegment(level, anchors[i].x + anchors[i].width - hookLength, anchors[i].x + anchors[i].width);
+                i++;
+            }
+        }
+    }
 }
 
 
