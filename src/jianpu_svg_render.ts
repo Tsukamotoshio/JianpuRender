@@ -23,7 +23,7 @@ import {
 
 import {
   SVGNS, drawSVGPath, drawSVGText, createSVGGroupChild, setBlinkAnimation,
-  setStroke, highlightElement, resetElementHighlight
+  setStroke, highlightElement, resetElementHighlight, measureSVGTextWidth
 } from './svg_tools';
 
 import  {
@@ -154,9 +154,10 @@ export class JianpuSVGRender {
   // belongs to, and the x/width anchors recorded so far for each group's
   // blocks as they get drawn one at a time in time order. A group's merged
   // beam bar(s) are drawn once its last block's anchor is recorded.
-  // Recomputed fresh on every full `redraw()` call -- see drawJianpuBlock()
-  // for why a group split across two *incremental* redraw calls isn't
-  // handled yet (that path isn't exercised until stage 3.6).
+  // Recomputed fresh on every full `redraw()` call. A group whose blocks are
+  // split across two *partial* redraw calls is not reconciled: the editor
+  // integration re-renders from a fresh instance on every edit rather than
+  // appending to an existing one, so that path stays unexercised.
   private beamGroupByBlock: Map<JianpuBlock, BeamGroup>;
   private beamGroupAnchors: Map<BeamGroup, Array<{ x: number; width: number }>>;
 
@@ -437,27 +438,30 @@ export class JianpuSVGRender {
                      contentWidth = Math.max(contentWidth, currentX + blockWidth);
                 }
 
-                // Track vertical bounds - Use getBBox for SVG coordinate space bounds
-                 const blockG = this.mainSVG.querySelector(`g[data-block-start="${block.start}"]`) as SVGGElement | null; // Use block.start for selector
-                  if (blockG) {
-                       try {
-                           const blockBox = blockG.getBBox(); // Use getBBox
-                           // Bounds are relative to the element's coordinate system
-                           // which is already transformed by mainG's baseline offset.
-                           const topY = blockBox.y;
-                           const bottomY = blockBox.y + blockBox.height;
-                           minHeight = Math.min(minHeight, topY);
-                           maxHeight = Math.max(maxHeight, bottomY);
-                       } catch (e) {
-                           // Ignore getBBox error if element is not rendered (display:none)
-                           // or has no graphical content yet.
-                       }
-                  }
-
                 // Update last rendered Q *after* processing the block fully
                 this.lastRenderedQ = startTimeQ + block.length; // Move marker to the end of the block
             }
         });
+
+        // Track vertical bounds once for the whole music group, rather than
+        // once per block inside the loop above. getBBox() forces a synchronous
+        // layout, so the per-block version cost one forced layout per block
+        // (hundreds for a real score) to compute a value that is by definition
+        // the union of them all -- exactly what the container's own bbox is.
+        // The container additionally encloses content drawn straight into
+        // musicG rather than into a block group (bar lines, merged beam bars),
+        // so the resulting bounds can only ever be equal or slightly taller,
+        // never tighter: no risk of clipping content that used to fit.
+        try {
+            const musicBox = this.musicG.getBBox();
+            if (musicBox.height > 0) {
+                minHeight = Math.min(minHeight, musicBox.y);
+                maxHeight = Math.max(maxHeight, musicBox.y + musicBox.height);
+            }
+        } catch (e) {
+            // Ignore getBBox error if the group is not rendered (display:none)
+            // or has no graphical content yet.
+        }
 
         // Update overall layout based on new content bounds
         this.height = Math.max(this.height, (maxHeight - minHeight) + this.config.noteHeight); // Add buffer
@@ -648,7 +652,7 @@ private drawNotes(
 
             const numText = `${note.jianpuNumber}`;
             const num = drawSVGText(noteG, numText, noteStartX, 0, FONT_SIZE, 'normal', 'start', 'middle', this.config.noteColor);
-            noteWidth = num.getBBox().width;
+            noteWidth = measureSVGTextWidth(num, numText, FONT_SIZE);
             noteEndX = noteStartX + noteWidth; // Number defines the main body width for now
           
         }
@@ -853,7 +857,7 @@ private drawRest(block: JianpuBlock, x: number, blockGroup: SVGGElement): number
     // --- Rest Symbol ('0') ---
     const restSymbol = '0';
     const restText = drawSVGText(blockGroup, restSymbol, currentX, 0, FONT_SIZE, 'normal', 'start', 'middle', this.config.noteColor);
-    const restWidth = restText.getBBox().width;
+    const restWidth = measureSVGTextWidth(restText, restSymbol, FONT_SIZE);
     noteEndX = currentX + restWidth;
 
      // --- Duration Underlines ---

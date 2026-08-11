@@ -88,6 +88,43 @@
    return child;
  }
  
+ /** Memoized glyph widths, keyed by the attributes that determine them. */
+ const textWidthCache = new Map<string, number>();
+
+ /**
+  * Measures a drawn SVG text element's width, memoizing by the attributes
+  * that actually determine it.
+  *
+  * `getBBox()` forces a synchronous layout, and the renderer calls it once
+  * per note and once per rest — hundreds of forced layouts for a full score,
+  * which dominated render time (a 280-note score spent ~20ms almost entirely
+  * here). Jianpu draws from a tiny alphabet, though: the digits 0-7 plus a
+  * couple of symbols, all at one of two font sizes within a render, and
+  * always in the same hardcoded `sans-serif` family (see drawSVGText). So
+  * the same handful of (text, size, weight) triples repeat for every note in
+  * the score, and each one's width only has to be measured once.
+  *
+  * A zero measurement is never cached: `getBBox()` returns 0 for elements
+  * that aren't laid out yet (detached from the document, `display: none`),
+  * and caching that would poison every later render of that glyph.
+  *
+  * @param e The already-drawn text element to measure
+  * @param text Its text content
+  * @param fontSize Its font-size attribute
+  * @param fontWeight Its font-weight attribute
+  * @returns The text width in user units
+  */
+ export function measureSVGTextWidth(
+   e: SVGTextElement, text: string, fontSize: string, fontWeight = 'normal'
+ ): number {
+   const key = `${fontWeight}|${fontSize}|${text}`;
+   const cached = textWidthCache.get(key);
+   if (cached !== undefined) return cached;
+   const width = e.getBBox().width;
+   if (width > 0) textWidthCache.set(key, width);
+   return width;
+ }
+
  /**
   * Creates a SVG group ('g') element and appends it to a parent.
   * @param parent The parent SVG element
