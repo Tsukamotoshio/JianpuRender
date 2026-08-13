@@ -333,6 +333,26 @@ export class JianpuSVGRender {
    * @param scrollIntoView If true, scroll the view to the active note (optional).
    * @returns The x-position of the highlighted note, or -1.
    */
+  /**
+   * Removes the playback highlight from every currently-highlighted note,
+   * leaving the score drawn exactly as it was before playback started.
+   *
+   * `redraw(note)` only ever clears notes *other* than the one it is about to
+   * highlight, so stopping playback had no way to clear the last one: callers
+   * were left either passing a deliberately non-existent note to exploit that
+   * "deactivate everything else" pass, or re-rendering the whole score. This
+   * is the explicit version of that intent.
+   */
+  public clearHighlight(): void {
+    this.playingNotes.forEach((_note, id) => {
+      const g = this.mainSVG.querySelector(`g[data-id="${id}"]`) as SVGGElement | null;
+      if (g) {
+        resetElementHighlight(g, this.config.noteColor);
+      }
+    });
+    this.playingNotes.clear();
+  }
+
   public redraw(
     activeNote?: NoteInfo,
     scrollIntoView?: boolean
