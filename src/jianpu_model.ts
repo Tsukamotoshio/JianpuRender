@@ -84,6 +84,12 @@ import {
       jianpuInfo.notes.forEach(note => {
           this.lastQ = Math.max(this.lastQ, note.start + note.length);
       });
+      // Fork addition: honour a caller-declared total length. `Add final rest
+      // if needed` below already knows how to fill the tail -- it just never
+      // had a length to fill up to, because lastQ was derived from the notes.
+      if (jianpuInfo.totalLength !== undefined) {
+          this.lastQ = Math.max(this.lastQ, jianpuInfo.totalLength);
+      }
       this.lastQ += 1e-6; // Small buffer for final block processing
   
       jianpuInfo.tempos = jianpuInfo.tempos && jianpuInfo.tempos.length ? jianpuInfo.tempos : [DEFAULT_TEMPO];

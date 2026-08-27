@@ -63,6 +63,17 @@ export interface JianpuInfo {
   keySignatures?: KeySignatureInfo[];
   /** All time signature changes in the score. They will get sorted by start q */
   timeSignatures?: TimeSignatureInfo[];
+  /**
+   * Total score length in quarter notes, when the caller knows it.
+   *
+   * SumisoraOMR fork addition. Without it the score's length is inferred from
+   * the notes alone, so anything after the last note simply is not drawn: a
+   * score of nothing but rests renders as an empty staff, and a half-entered
+   * one stops dead at its last note. An editor needs those trailing rests --
+   * they are where the user is about to type. Ignored when shorter than the
+   * notes themselves, so it can only ever extend the score, never truncate it.
+   */
+  totalLength?: number;
 }
 
 /** Default tempo in case none is found (60 bpm) */
