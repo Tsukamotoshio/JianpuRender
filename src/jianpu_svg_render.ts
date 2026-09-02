@@ -145,6 +145,7 @@ export class JianpuSVGRender {
   private lastKnownScrollLeft: number;
   private isScrolling: boolean;
   private currentKey: number;
+  private currentKeyLabel?: string;   // Fork: caption to draw verbatim, when the caller gave one
   private currentTimeSignature: TimeSignatureInfo;
   private playingNotes: Map<string, NoteInfo>; // Map key: `${start}-${pitch}`
   private lastRenderedQ: number; // Track the last quarter note time rendered
@@ -218,6 +219,7 @@ export class JianpuSVGRender {
      // --- Initial Model Creation ---
     this.jianpuModel = new JianpuModel(this.jianpuInfo, this.config.defaultKey);
     this.currentKey = this.jianpuModel.measuresInfo.keySignatureAtQ(0);
+    this.currentKeyLabel = this.jianpuModel.measuresInfo.keySignatureLabelAtQ(0);
     this.currentTimeSignature = this.jianpuModel.measuresInfo.timeSignatureAtQ(0) ?? DEFAULT_TIME_SIGNATURE;
 
 
@@ -295,6 +297,7 @@ export class JianpuSVGRender {
 
     // Initial signature setup
     this.currentKey = this.jianpuModel.measuresInfo.keySignatureAtQ(0);
+    this.currentKeyLabel = this.jianpuModel.measuresInfo.keySignatureLabelAtQ(0);
     this.currentTimeSignature = this.jianpuModel.measuresInfo.timeSignatureAtQ(0) ?? DEFAULT_TIME_SIGNATURE;
     this.drawSignatures(this.overlayG, 0, true, true); // Draw initial signatures in overlay
     this.updateLayout(); // Set initial sizes
@@ -932,8 +935,11 @@ private drawRest(block: JianpuBlock, x: number, blockGroup: SVGGElement): number
 
        // --- Key Signature (e.g., 1=C) ---
        if (drawKey) {
-           const keyName = PITCH_CLASS_NAMES[this.currentKey % 12] ?? 'C';
-           const keyText = `1=${keyName}`;
+           // Prefer the caller's caption: rebuilding it from the pitch class
+           // loses both the mode (minor reads as its relative major) and the
+           // spelling (Bb reads as A#). See KeySignatureInfo.label.
+           const keyText = this.currentKeyLabel
+               ?? `1=${PITCH_CLASS_NAMES[this.currentKey % 12] ?? 'C'}`;
            const keySig = drawSVGText(container, keyText, currentX, 0, keyFontSize, 'normal', 'start', 'middle', this.config.noteColor);
            currentX += keySig.getBBox().width + spacing * 2; // More space after key sig
        }
@@ -986,6 +992,7 @@ private drawRest(block: JianpuBlock, x: number, blockGroup: SVGGElement): number
       const newKey = this.jianpuModel.measuresInfo.keySignatureAtQ(timeQ, true); // Check for exact change
       if (newKey !== -1 && newKey !== this.currentKey) {
           this.currentKey = newKey;
+          this.currentKeyLabel = this.jianpuModel.measuresInfo.keySignatureLabelAtQ(timeQ);
           return true;
       }
       return false;
@@ -1057,6 +1064,7 @@ private drawRest(block: JianpuBlock, x: number, blockGroup: SVGGElement): number
         let needsRedraw = false;
         if (keyAtScroll !== this.currentKey) {
             this.currentKey = keyAtScroll;
+            this.currentKeyLabel = this.jianpuModel.measuresInfo.keySignatureLabelAtQ(scrolledTimeQ);
             needsRedraw = true;
         }
          if (timeSigAtScroll.numerator !== this.currentTimeSignature.numerator ||

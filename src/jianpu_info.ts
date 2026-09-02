@@ -41,6 +41,20 @@ export interface KeySignatureInfo {
   start: number;
   /** Key signature (0=C, 1=C#/Db, ..., 11=B) from this quarter on */
   key: number; // Represents the *tonic* key, e.g., 0 for C, 7 for G, 5 for F
+  /**
+   * Exactly how to write this key, e.g. `1=Bb` or `6=A`.
+   *
+   * SumisoraOMR fork addition. `key` is a pitch class, which is all the digit
+   * mapping needs but strictly less than the label carries: it cannot say
+   * whether the score is major or minor (a piece in A minor and one in C major
+   * share pitch class 0), and it cannot say whether the tonic is spelled Bb or
+   * A#. Rebuilding the caption from the number therefore mislabels both cases,
+   * and measurably so -- 23 of the 74 scores in this project's corpus were
+   * captioned wrongly. When a caller knows the answer it passes it here and it
+   * is drawn verbatim; without it the old reconstruction still applies, so the
+   * renderer keeps working standalone.
+   */
+  label?: string;
 }
 
 /** Stores information related to a time signature change on a score */

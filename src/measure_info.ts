@@ -233,6 +233,12 @@ export class MeasuresInfo {
     return !onlyChanges || (measureInfo.keyChange && isExactStart) ? measureInfo.keySignature.key : -1;
   }
 
+  /** The caller-supplied caption for the key in force at *start*, if any. */
+  public keySignatureLabelAtQ(start: number): string | undefined {
+    if (this.measuresInfo.length === 0) return undefined;
+    return this.measuresInfo[this.findIndex(start)].keySignature.label;
+  }
+
   /**
    * Gets the time signature at a given time position.
    * @param start Time in quarter notes.
