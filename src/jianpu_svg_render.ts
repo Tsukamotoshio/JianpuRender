@@ -941,6 +941,10 @@ private drawRest(block: JianpuBlock, x: number, blockGroup: SVGGElement): number
            const keyText = this.currentKeyLabel
                ?? `1=${PITCH_CLASS_NAMES[this.currentKey % 12] ?? 'C'}`;
            const keySig = drawSVGText(container, keyText, currentX, 0, keyFontSize, 'normal', 'start', 'middle', this.config.noteColor);
+           // Fork: mark it so a host can hit-test the caption and edit in place.
+           // Same idea as the stable `data-id` on note groups -- without a
+           // handle these are anonymous <text> nodes and nothing can find them.
+           keySig.setAttribute('data-signature', 'key');
            currentX += keySig.getBBox().width + spacing * 2; // More space after key sig
        }
 
@@ -958,6 +962,7 @@ private drawRest(block: JianpuBlock, x: number, blockGroup: SVGGElement): number
                 'middle',  // 垂直居中
                 this.config.noteColor
             );
+            timeSig.setAttribute('data-signature', 'time');   // Fork: see above
             currentX += timeSig.getBBox().width + spacing;
        }
 
