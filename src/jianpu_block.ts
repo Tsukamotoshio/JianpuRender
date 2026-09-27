@@ -76,6 +76,9 @@ export function splitJianpuNote(jianpuNote: JianpuNote, quarters: number): Jianp
       jianpuNumber: jianpuNote.jianpuNumber,
       octaveDot: jianpuNote.octaveDot,
       accidental: 0, // Accidental only applies to the first part
+      // `dynamic` is deliberately not carried over either: the halves of a
+      // split are one sounding note, and a mark drawn under each of them
+      // would read as two (fork addition, same rule as the accidental).
       tiedFrom: jianpuNote, // The new note is tied *from* the modified original
       // Rendering properties will be recalculated later
   };

@@ -18,7 +18,8 @@
 import {
   LINE_STROKE_WIDTH, COMPACT_SPACING_FACTOR, UNDERLINE_SPACING_FACTOR,
   OCTAVE_DOT_OFFSET_FACTOR, DOT_SIZE_FACTOR, AUGMENTATION_DASH_FACTOR,
-  FONT_SIZE_MULTIPLIER, SMALL_FONT_SIZE_MULTIPLIER, DURATION_LINE_SCALES
+  FONT_SIZE_MULTIPLIER, SMALL_FONT_SIZE_MULTIPLIER, DURATION_LINE_SCALES,
+  DYNAMIC_Y_FACTOR, DYNAMIC_FONT_SIZE_MULTIPLIER
 } from './render_constants';
 
 import {
@@ -732,6 +733,28 @@ private drawNotes(
              noteEndX = augmentationX + noteSpacing;
          }
 
+
+        // --- Dynamic mark (fork addition) ---
+        // Under the note, below the octave dots and the duration underlines,
+        // in the bold italic dynamics are conventionally set in -- the same
+        // place and the same look LilyPond gives them, so the editor and the
+        // PDF it exports show the mark in the same relation to the note.
+        // Drawn inside noteG so that selecting or highlighting the note takes
+        // its mark with it, and so that a deleted note cannot leave one behind.
+        if (note.dynamic) {
+            const dynamicFontSize = `${this.config.noteHeight * DYNAMIC_FONT_SIZE_MULTIPLIER}px`;
+            const markX = noteStartX + noteWidth / 2;
+            const mark = drawSVGText(
+                noteG, note.dynamic, markX, this.config.noteHeight * DYNAMIC_Y_FACTOR,
+                dynamicFontSize, 'bold', 'middle', 'hanging', this.config.noteColor);
+            mark.setAttributeNS(null, 'font-style', 'italic');
+            mark.setAttributeNS(null, 'data-dynamic', note.dynamic);
+            // Widen the note's footprint by half the overhang on the right:
+            // 'sfz' under a single digit is wider than the digit, and without
+            // this the next note would be drawn over it in compact mode.
+            const markWidth = measureSVGTextWidth(mark, note.dynamic, dynamicFontSize);
+            noteEndX = Math.max(noteEndX, markX + markWidth / 2);
+        }
 
         // --- Ties ---
 

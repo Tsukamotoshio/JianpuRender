@@ -25,6 +25,21 @@ export interface NoteInfo {
   pitch: number;
   /** Note intensity according to MIDI velocity */
   intensity: number;
+  /**
+   * An absolute dynamic printed under this note, in LilyPond's spelling
+   * without the backslash -- 'p', 'mf', 'sfz'. Absent or empty for none.
+   *
+   * SumisoraOMR fork addition. JianpuInfo had no notion of dynamics, so a
+   * score carrying them (5 of the 40 MusicXML files in this project's corpus
+   * do) showed none on screen while the PDF exported from the very same
+   * document showed them all: the editor disagreed with its own output.
+   *
+   * Carried on the note rather than as a separate timed list because that is
+   * where the notation itself puts it -- in jianpu-ly the mark is a
+   * post-event on a note, so a note that moves takes its mark along, and an
+   * editor that inserts or deletes notes has nothing extra to keep in step.
+   */
+  dynamic?: string;
 }
 
 /** Stores information related to a tempo change on a score (not used yet) */

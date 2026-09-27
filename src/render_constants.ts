@@ -42,6 +42,18 @@ export const AUGMENTATION_SPACING_FACTOR = 0.2;
 /** Default font size multiplier relative to config.noteHeight */
 export const FONT_SIZE_MULTIPLIER = 1.2; // Adjust for good number size
 
+/**
+ * Top edge of a dynamic mark, below the number's baseline (relative to note
+ * height). It has to clear everything else drawn under a note: three octave
+ * dots reach 1.16 (OCTAVE_DOT_OFFSET_FACTOR * 0.6 + 2 * DOT_SIZE_FACTOR * 2.8)
+ * and four duration underlines reach 1.1 (UNDERLINE_SPACING_FACTOR * 2.5 + 3 *
+ * UNDERLINE_SPACING_FACTOR), so this sits just under the deeper of the two.
+ */
+export const DYNAMIC_Y_FACTOR = 1.35;
+
+/** Font size multiplier for dynamic marks (relative to config.noteHeight) */
+export const DYNAMIC_FONT_SIZE_MULTIPLIER = 0.8;
+
 /** Font size multiplier for smaller elements like accidentals, time signatures */
 export const SMALL_FONT_SIZE_MULTIPLIER = 0.75;
 
