@@ -40,6 +40,17 @@ export interface NoteInfo {
    * editor that inserts or deletes notes has nothing extra to keep in step.
    */
   dynamic?: string;
+  /**
+   * '<' when a crescendo begins on this note, '>' for a decrescendo.
+   *
+   * SumisoraOMR fork addition, alongside `dynamic`. A hairpin spans notes but
+   * is written as two halves that each belong to one note -- which is how
+   * LilyPond and jianpu-ly store it, and what keeps an unfinished one (the
+   * normal state while typing) representable at all.
+   */
+  hairpinStart?: string;
+  /** True when a `\!` on this note ends a hairpin begun on an earlier one. */
+  hairpinEnd?: boolean;
 }
 
 /** Stores information related to a tempo change on a score (not used yet) */

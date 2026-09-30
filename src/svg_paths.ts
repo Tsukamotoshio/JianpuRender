@@ -45,3 +45,11 @@ export const augmentationDashPath = 'm 0,0 h 50'; // Width 50, at y=0 (adjust wi
 export const tiePath = `M -13,5 C 15,-15 65,-15 90,5 C 65,-25 15,-25 -13,5 Z`;  // Basic arc below baseline
 /** Dot Path (circle for octave/augmentation) */
 export const dotPath = 'M 0 0 a 15 15 0 1 0 0.0001 0 z'; // Circle centered at 0,0, radius 15
+// --- Hairpins (SumisoraOMR fork addition) ---
+// Unit wedges on a 100x100 box centred on y=0, scaled to the span and height
+// they need. Open end to the right for a crescendo, to the left for a
+// decrescendo -- the tip sits on the side the music comes from.
+/** Crescendo wedge: tip at the left, opening rightwards */
+export const crescendoPath = 'M 100,-50 L 0,0 L 100,50';
+/** Decrescendo wedge: opening at the left, tip at the right */
+export const decrescendoPath = 'M 0,-50 L 100,0 L 0,50';

@@ -19,7 +19,8 @@ import {
   LINE_STROKE_WIDTH, COMPACT_SPACING_FACTOR, UNDERLINE_SPACING_FACTOR,
   OCTAVE_DOT_OFFSET_FACTOR, DOT_SIZE_FACTOR, AUGMENTATION_DASH_FACTOR,
   FONT_SIZE_MULTIPLIER, SMALL_FONT_SIZE_MULTIPLIER, DURATION_LINE_SCALES,
-  DYNAMIC_Y_FACTOR, DYNAMIC_FONT_SIZE_MULTIPLIER
+  DYNAMIC_Y_FACTOR, DYNAMIC_FONT_SIZE_MULTIPLIER,
+  HAIRPIN_HEIGHT_FACTOR, HAIRPIN_GAP_FACTOR
 } from './render_constants';
 
 import {
@@ -29,7 +30,8 @@ import {
 
 import  {
   PATH_SCALE, ACCIDENTAL_TEXT, // Using text for accidentals
-  barPath, underlinePath, augmentationDashPath, tiePath, dotPath
+  barPath, underlinePath, augmentationDashPath, tiePath, dotPath,
+  crescendoPath, decrescendoPath
 } from './svg_paths';
 
 import {
@@ -162,6 +164,16 @@ export class JianpuSVGRender {
   // appending to an existing one, so that path stays unexercised.
   private beamGroupByBlock: Map<JianpuBlock, BeamGroup>;
   private beamGroupAnchors: Map<BeamGroup, Array<{ x: number; width: number }>>;
+  /**
+   * The hairpin waiting for the note that closes it, during one drawing pass
+   * (fork addition). A hairpin spans notes, so it can only be drawn once the
+   * note it ends on has a position -- the same bookkeeping ties already do.
+   * `markEl` is the dynamic drawn on the note it started from, kept so an
+   * unfinished hairpin can take it away again; see finishOpenHairpin().
+   */
+  private openHairpin: {
+    direction: string; xFrom: number; markEl: SVGTextElement | null;
+  } | null = null;
 
   // Layout & Scaling
   private numberFontSize: number;
@@ -256,6 +268,7 @@ export class JianpuSVGRender {
     while (this.div.lastChild) {
       this.div.removeChild(this.div.lastChild);
     }
+    this.openHairpin = null;   // fork: the element it pointed at is gone too
     this.div.style.position = 'relative'; // Needed for overlay positioning
     this.div.style.overflow = 'hidden'; // Hide internal scrollbars if parentElement scrolls
 
@@ -433,6 +446,7 @@ export class JianpuSVGRender {
             for (const block of group.blocks) this.beamGroupByBlock.set(block, group);
         }
         this.beamGroupAnchors = new Map();
+        this.openHairpin = null;   // fork: no hairpin carries over into a pass
 
         let currentX = this.width; // Start drawing from the end of previous content
         let contentWidth = this.width;
@@ -466,6 +480,10 @@ export class JianpuSVGRender {
                 this.lastRenderedQ = startTimeQ + block.length; // Move marker to the end of the block
             }
         });
+
+        // Fork: settle a hairpin left open by the last note before measuring,
+        // since dropping its mark changes the bounds the height comes from.
+        this.finishOpenHairpin();
 
         // Track vertical bounds once for the whole music group, rather than
         // once per block inside the loop above. getBBox() forces a synchronous
@@ -741,6 +759,7 @@ private drawNotes(
         // PDF it exports show the mark in the same relation to the note.
         // Drawn inside noteG so that selecting or highlighting the note takes
         // its mark with it, and so that a deleted note cannot leave one behind.
+        let markEl: SVGTextElement | null = null;
         if (note.dynamic) {
             const dynamicFontSize = `${this.config.noteHeight * DYNAMIC_FONT_SIZE_MULTIPLIER}px`;
             const markX = noteStartX + noteWidth / 2;
@@ -754,6 +773,30 @@ private drawNotes(
             // this the next note would be drawn over it in compact mode.
             const markWidth = measureSVGTextWidth(mark, note.dynamic, dynamicFontSize);
             noteEndX = Math.max(noteEndX, markX + markWidth / 2);
+            markEl = mark;
+        }
+
+        // --- Hairpins (fork addition) ---
+        // The wedge spans from the note it starts on to the note that closes
+        // it, so it can only be drawn once that second note has a position --
+        // the same bookkeeping ties do. It goes into musicG, not into either
+        // note's group, because it belongs to neither of them alone.
+        //
+        // A `\!` closes one, and so does any dynamic, but only one begun on an
+        // *earlier* note: written on the starting note itself, LilyPond draws
+        // no wedge at all. Closing first and opening second is what gives a
+        // note that both ends one hairpin and starts another the right shape.
+        if (this.openHairpin && (note.hairpinEnd || note.dynamic)) {
+            this.drawHairpin(this.openHairpin,
+                noteStartX - this.config.noteHeight * HAIRPIN_GAP_FACTOR);
+            this.openHairpin = null;
+        }
+        if (note.hairpinStart) {
+            this.openHairpin = {
+                direction: note.hairpinStart,
+                xFrom: noteEndX + this.config.noteHeight * HAIRPIN_GAP_FACTOR,
+                markEl,
+            };
         }
 
         // --- Ties ---
@@ -812,6 +855,49 @@ private drawNotes(
     }); // End forEach note
 
     return maxX - x; // Return the width of the content drawn
+}
+
+/**
+ * Draws one hairpin wedge, on the same row as the dynamic marks so that a
+ * `p` and the crescendo leaving it sit on one line, as they do in engraved
+ * music (fork addition).
+ * @param open The hairpin being closed: its direction and its left edge.
+ * @param xTo Right edge of the wedge, just before the note that closes it.
+ */
+private drawHairpin(
+    open: { direction: string; xFrom: number },
+    xTo: number
+): void {
+    const width = xTo - open.xFrom;
+    if (width <= 1) {
+        return;   // the two notes are touching: there is no room for a wedge
+    }
+    const height = this.config.noteHeight * HAIRPIN_HEIGHT_FACTOR;
+    const yMid = this.config.noteHeight
+        * (DYNAMIC_Y_FACTOR + DYNAMIC_FONT_SIZE_MULTIPLIER / 2);
+    const path = open.direction === '>' ? decrescendoPath : crescendoPath;
+    const wedge = drawSVGPath(this.musicG, path, open.xFrom, yMid,
+        width / PATH_SCALE, height / PATH_SCALE);
+    setStroke(wedge, this.config.noteColor, LINE_STROKE_WIDTH);
+    wedge.setAttributeNS(null, 'fill', 'none');   // two lines, not a triangle
+    wedge.setAttributeNS(null, 'data-hairpin', open.direction);
+}
+
+/**
+ * Ends a drawing pass. A hairpin that nothing closed is not drawn at all,
+ * and it takes the dynamic on its starting note down with it -- that is what
+ * LilyPond does with an unterminated one, verified by rendering, and showing
+ * it here is the only way the editor agrees with the PDF it exports. The
+ * linter warns about this case in words; this is its picture.
+ */
+private finishOpenHairpin(): void {
+    if (!this.openHairpin) {
+        return;
+    }
+    if (this.openHairpin.markEl) {
+        this.openHairpin.markEl.remove();
+    }
+    this.openHairpin = null;
 }
 
 /**

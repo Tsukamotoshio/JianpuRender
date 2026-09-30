@@ -73,3 +73,31 @@ test('dynamic: a note long enough for the model to split keeps exactly one mark'
   t.equal(marked[0].start, 0, 'on the fragment the note starts at');
   t.end();
 });
+
+test('hairpin: both halves reach the block model on their own notes', (t: test.Test) => {
+  const info: JianpuInfo = {
+    notes: [
+      { start: 0, length: 1, pitch: 60, intensity: 80, hairpinStart: '<' },
+      { start: 1, length: 1, pitch: 62, intensity: 80, hairpinEnd: true },
+    ],
+    keySignatures: [{ start: 0, key: 0 }],
+    timeSignatures: [{ start: 0, numerator: 4, denominator: 4 }],
+  };
+  const notes = notesOf(new JianpuModel(info));
+  t.equal(notes[0].hairpinStart, '<', 'the note it starts on');
+  t.equal(notes[1].hairpinEnd, true, 'the note it ends on');
+  t.equal(notes[0].hairpinEnd, undefined, 'and nothing invented on either');
+  t.end();
+});
+
+test('hairpin: splitting a note leaves its half on the first fragment only', (t: test.Test) => {
+  const note: JianpuNote = {
+    start: 0, length: 2, pitch: 60, intensity: 80, hairpinStart: '>', hairpinEnd: true,
+    jianpuNumber: 1, octaveDot: 0, accidental: 0,
+  };
+  const second = splitJianpuNote(note, 1);
+  t.equal(note.hairpinStart, '>', 'first half keeps the start');
+  t.equal(second!.hairpinStart, undefined, 'second half has none');
+  t.equal(second!.hairpinEnd, undefined, 'nor an end it never had');
+  t.end();
+});

@@ -64,3 +64,14 @@ export const DURATION_LINE_SCALES = new Map<number, number>([
     [3, 1.3],
     [4, 1.15]
 ]);
+
+/**
+ * Height of a hairpin wedge at its open end (relative to note height).
+ * Set by putting the same score through LilyPond and matching the opening
+ * against the digits beside it: at 0.42 the wedge read as a flat sliver next
+ * to LilyPond's.
+ */
+export const HAIRPIN_HEIGHT_FACTOR = 0.6;
+
+/** Gap between a hairpin and the notes (or marks) it runs between, in note heights */
+export const HAIRPIN_GAP_FACTOR = 0.25;
