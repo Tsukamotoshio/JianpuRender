@@ -51,6 +51,24 @@ export interface NoteInfo {
   hairpinStart?: string;
   /** True when a `\!` on this note ends a hairpin begun on an earlier one. */
   hairpinEnd?: boolean;
+  /**
+   * How the note is written: its digit (1-7). When present, `octaveDot` and
+   * `accidental` are read alongside it and nothing is derived from `pitch`.
+   *
+   * SumisoraOMR fork addition. Upstream only ever had a MIDI pitch to go on,
+   * so it decided the digit, the octave dots and the accidental itself --
+   * with its own octave convention and its own sharp-or-flat spelling. A
+   * caller that already holds a written score (a jianpu text, which is what
+   * gets printed) then saw a different score on screen than on paper: in
+   * that project's corpus 5887 of 6980 notes differed, mostly by one octave
+   * dot in every key but C. Supplying the written form makes the drawing
+   * show what was written; leaving it out keeps upstream's behaviour.
+   */
+  jianpuNumber?: number;
+  /** Octave dots as written: positive above, negative below. Read only with `jianpuNumber`. */
+  octaveDot?: number;
+  /** Accidental as written, coded as JianpuNote's: 0 none, 1 sharp, 2 flat. Read only with `jianpuNumber`. */
+  accidental?: number;
 }
 
 /** Stores information related to a tempo change on a score (not used yet) */

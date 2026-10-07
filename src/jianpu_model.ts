@@ -208,13 +208,22 @@ import {
      * @returns A processed JianpuNote.
      */
      private createJianpuNote(note: NoteInfo, key: number): JianpuNote {
-          const details = mapMidiToJianpu(note.pitch, key);
-  
+          // Fork: a note that says how it is written is drawn that way. The
+          // three fields go together -- deriving the dots from the pitch
+          // while taking the digit as written could mix two octave
+          // conventions on one note -- so the derivation runs only for a
+          // note that gives no digit at all (upstream's performance-style input).
+          const details = note.jianpuNumber !== undefined
+              ? { jianpuNumber: note.jianpuNumber,
+                  octaveDot: note.octaveDot ?? 0,
+                  accidental: note.accidental ?? 0 }
+              : mapMidiToJianpu(note.pitch, key);
+
           const jianpuNote: JianpuNote = {
               ...note,
               jianpuNumber: details.jianpuNumber,
               octaveDot: details.octaveDot,
-              accidental: details.accidental, // Directly use accidental from key context
+              accidental: details.accidental,
           };
           return jianpuNote;
       }
