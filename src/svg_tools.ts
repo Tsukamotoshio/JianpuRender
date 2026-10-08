@@ -57,6 +57,7 @@
   * @param dominantBaseline Vertical alignment ('middle', 'hanging', 'central', 'mathematical', 'text-bottom', 'text-top')
   * @param fill Text color
   * @param opacity Opacity (0 to 1)
+  * @param fontFamily Font family (e.g., 'sans-serif', '"Times New Roman", serif'). Defaults to 'sans-serif'.
   * @returns The drawn SVG text element
   */
  export function drawSVGText(
@@ -65,10 +66,11 @@
    textAnchor: 'start' | 'middle' | 'end' = 'middle',
    dominantBaseline: string = 'middle', // Use string for broader SVG values
    fill = 'currentColor', // Default to inheriting color
-   opacity = 1
+   opacity = 1,
+   fontFamily = 'sans-serif'
  ): SVGTextElement { // Return SVGTextElement specifically
    const child = document.createElementNS(SVGNS, 'text');
-   child.setAttributeNS(null, 'font-family', 'sans-serif'); // Simple default
+   child.setAttributeNS(null, 'font-family', fontFamily);
    child.setAttributeNS(null, 'font-size', fontSize);
    child.setAttributeNS(null, 'font-weight', fontWeight);
    child.setAttributeNS(null, 'x', `${x}`);
@@ -99,10 +101,10 @@
   * per note and once per rest — hundreds of forced layouts for a full score,
   * which dominated render time (a 280-note score spent ~20ms almost entirely
   * here). Jianpu draws from a tiny alphabet, though: the digits 0-7 plus a
-  * couple of symbols, all at one of two font sizes within a render, and
-  * always in the same hardcoded `sans-serif` family (see drawSVGText). So
-  * the same handful of (text, size, weight) triples repeat for every note in
-  * the score, and each one's width only has to be measured once.
+  * couple of symbols, all at one of two font sizes within a render, and in
+  * the one family the renderer is configured with. So the same handful of
+  * (family, weight, size, text) combinations repeat for every note in the
+  * score, and each one's width only has to be measured once.
   *
   * A zero measurement is never cached: `getBBox()` returns 0 for elements
   * that aren't laid out yet (detached from the document, `display: none`),
@@ -117,7 +119,12 @@
  export function measureSVGTextWidth(
    e: SVGTextElement, text: string, fontSize: string, fontWeight = 'normal'
  ): number {
-   const key = `${fontWeight}|${fontSize}|${text}`;
+   // The family comes off the element itself: since fontFamily became
+   // configurable (upstream 1.2.4), two renderers on one page can draw the
+   // same digit in different fonts, and a key without it would hand one
+   // the other's width.
+   const family = e.getAttribute('font-family') ?? '';
+   const key = `${family}|${fontWeight}|${fontSize}|${text}`;
    const cached = textWidthCache.get(key);
    if (cached !== undefined) return cached;
    const width = e.getBBox().width;
@@ -209,7 +216,8 @@ export function setBlinkAnimation(
  }
  
  /**
-  * Highlights an element by changing its fill color.
+  * Highlights an element by changing its fill color, and its stroke color
+  * for elements that have a stroke (e.g. duration underlines, dashes, bar lines).
   * Often used for active notes.
   * @param e The SVG element (typically a group containing note parts)
   * @param color The highlight color
@@ -228,11 +236,16 @@ export function setBlinkAnimation(
     toHighlight.push(el);
   });
 
-  // Apply the fill color
+  // Apply the fill color, and the stroke color for stroked elements
   toHighlight.forEach(child => {
     // Skip elements with fill="none"
     if (child.getAttribute('fill') !== 'none') {
       child.setAttribute('fill', color);
+    }
+    // Also highlight elements colored via stroke (underlines, dashes, ties, bar lines)
+    const stroke = child.getAttribute('stroke');
+    if (stroke !== null && stroke !== 'none') {
+      child.setAttribute('stroke', color);
     }
   });
 
@@ -241,7 +254,7 @@ export function setBlinkAnimation(
 
  
  /**
-  * Resets the highlight of an element, reverting to a default color.
+  * Resets the highlight of an element, reverting fill and stroke to a default color.
   * @param e The SVG element (typically a group)
   * @param defaultColor The color to revert to
   */
@@ -250,6 +263,11 @@ export function setBlinkAnimation(
       children.forEach((child: SVGElement) => {
           if (child.getAttribute('fill') !== 'none') {
               child.setAttribute('fill', defaultColor);
+          }
+          // Restore stroked elements (underlines, dashes, ties, bar lines) as well
+          const stroke = child.getAttribute('stroke');
+          if (stroke !== null && stroke !== 'none') {
+              child.setAttribute('stroke', defaultColor);
           }
       });
 }

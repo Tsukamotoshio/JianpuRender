@@ -20,7 +20,8 @@ import {
   OCTAVE_DOT_OFFSET_FACTOR, DOT_SIZE_FACTOR, AUGMENTATION_DASH_FACTOR,
   FONT_SIZE_MULTIPLIER, SMALL_FONT_SIZE_MULTIPLIER, DURATION_LINE_SCALES,
   DYNAMIC_Y_FACTOR, DYNAMIC_FONT_SIZE_MULTIPLIER,
-  HAIRPIN_HEIGHT_FACTOR, HAIRPIN_GAP_FACTOR
+  HAIRPIN_HEIGHT_FACTOR, HAIRPIN_GAP_FACTOR,
+  LYRIC_OFFSET_FACTOR
 } from './render_constants';
 
 import {
@@ -87,6 +88,15 @@ export interface JianpuSVGRenderConfig {
   width?: number;
    /** Explicitly set the height of the SVG container */
   height?: number;
+  /** Whether to draw the measure (bar) number centered above each measure-start bar line. Default false. */
+  showBarNumbers?: boolean;
+  /** Whether to draw tempo markings as "♩=qpm" after the key/time signatures at
+   *  the start of the score, and inline at every tempo change within the score.
+   *  Default false. Note: the quarter-note glyph (♩, U+2669) is written as plain
+   *  text and relies on the browser's font fallback to render. */
+  showTempoMarking?: boolean;
+  /** Called when a rendered note is clicked. Receives the note data and its SVG group. */
+  onNoteClick?: (note: JianpuNote, element: SVGGElement) => void;
 }
 
 /** Internal structure to track visual elements tied together (e.g., across blocks). */
@@ -150,9 +160,19 @@ export class JianpuSVGRender {
   private currentKey: number;
   private currentKeyLabel?: string;   // Fork: caption to draw verbatim, when the caller gave one
   private currentTimeSignature: TimeSignatureInfo;
+  private currentTempoQpm: number;
   private playingNotes: Map<string, NoteInfo>; // Map key: `${start}-${pitch}`
   private lastRenderedQ: number; // Track the last quarter note time rendered
   private estimatedNoteWidth: number; // Estimated width of a basic number for spacing
+  private destroyed: boolean; // 已销毁标志，阻止后续 clear/redraw 操作
+
+  // Hot-path element caches (avoid full-tree querySelector on every highlighted note)
+  private noteGroupCache: Map<string, SVGGElement>; // Key: noteId `${start}-${pitch}`
+
+  // Click-delegation map: noteId `${start}-${pitch}` → the JianpuNote drawn
+  // into the note group carrying that data-id. Filled in drawNotes, cleared
+  // whenever the SVG structure is rebuilt (clear) or released (destroy).
+  private noteById: Map<string, JianpuNote>;
 
   // Beam grouping (see beam_grouping.ts): which BeamGroup (if any) each block
   // belongs to, and the x/width anchors recorded so far for each group's
@@ -227,6 +247,9 @@ export class JianpuSVGRender {
       fontFamily: config.fontFamily ?? 'sans-serif',
       width: config.width ?? 0, // Auto-width by default
       height: config.height ?? 0, // Auto-height by default
+      showBarNumbers: config.showBarNumbers ?? false,
+      showTempoMarking: config.showTempoMarking ?? false,
+      onNoteClick: config.onNoteClick, // 可选回调，无默认值
     };
 
      // --- Initial Model Creation ---
@@ -234,16 +257,20 @@ export class JianpuSVGRender {
     this.currentKey = this.jianpuModel.measuresInfo.keySignatureAtQ(0);
     this.currentKeyLabel = this.jianpuModel.measuresInfo.keySignatureLabelAtQ(0);
     this.currentTimeSignature = this.jianpuModel.measuresInfo.timeSignatureAtQ(0) ?? DEFAULT_TIME_SIGNATURE;
+    this.currentTempoQpm = this.jianpuModel.measuresInfo.tempoAtQ(0);
 
 
     // --- Initialize State & Layout ---
     this.playingNotes = new Map();
+    this.noteGroupCache = new Map();
+    this.noteById = new Map();
     this.lastRenderedQ = -1;
     this.signaturesBlinking = false;
     this.lastKnownScrollLeft = 0;
     this.isScrolling = false;
     this.beamGroupByBlock = new Map();
     this.beamGroupAnchors = new Map();
+    this.destroyed = false;
 
     // Calculate scaling and font sizes based on noteHeight
     this.numberFontSize = this.config.noteHeight * FONT_SIZE_MULTIPLIER;
@@ -264,6 +291,7 @@ export class JianpuSVGRender {
    * Clears the SVG elements and resets internal state for a fresh draw.
    */
   public clear() {
+    if (this.destroyed) return; // 已销毁：不重建 SVG 结构，避免复活已释放的资源
     // Empty the container div
     while (this.div.lastChild) {
       this.div.removeChild(this.div.lastChild);
@@ -300,8 +328,16 @@ export class JianpuSVGRender {
     this.signaturesG = createSVGGroupChild(this.mainG, 'signatures'); // In-line signatures
     this.musicG = createSVGGroupChild(this.mainG, 'music'); // Notes, rests, bars, ties
 
+    // Click delegation for note interaction: a single listener on the SVG root
+    // instead of one per note group. handleNoteClick is a stable arrow-function
+    // reference, so the removeEventListener in destroy() always targets the
+    // same listener instance.
+    this.mainSVG.addEventListener('click', this.handleNoteClick);
+
     // Reset state
     this.playingNotes.clear();
+    this.noteGroupCache.clear(); // 重建后旧 SVG 元素全部失效，缓存必须一并清空
+    this.noteById.clear(); // 重建后旧 noteId 映射一并失效，由 drawNotes 重新填充
     this.lastRenderedQ = -1;
     this.signaturesBlinking = false;
     this.lastKnownScrollLeft = 0;
@@ -313,8 +349,33 @@ export class JianpuSVGRender {
     this.currentKey = this.jianpuModel.measuresInfo.keySignatureAtQ(0);
     this.currentKeyLabel = this.jianpuModel.measuresInfo.keySignatureLabelAtQ(0);
     this.currentTimeSignature = this.jianpuModel.measuresInfo.timeSignatureAtQ(0) ?? DEFAULT_TIME_SIGNATURE;
-    this.drawSignatures(this.overlayG, 0, true, true); // Draw initial signatures in overlay
+    this.currentTempoQpm = this.jianpuModel.measuresInfo.tempoAtQ(0);
+    this.drawSignatures(this.overlayG, 0, true, true, this.config.showTempoMarking); // Draw initial signatures in overlay
     this.updateLayout(); // Set initial sizes
+  }
+
+  /**
+   * Destroys the renderer and releases all resources it holds:
+   * removes the scroll listener from parentElement, stops the overlay blink
+   * animation, empties the container div and drops every cached element
+   * reference. After this call the instance is unusable — clear() and
+   * redraw() become no-ops (returning -1) instead of rebuilding the SVG.
+   */
+  public destroy(): void {
+    if (this.destroyed) return; // Already destroyed, nothing left to release
+    this.parentElement.removeEventListener('scroll', this.handleScrollEvent); // handleScrollEvent is a stable arrow-function reference
+    // Defensive: the click listener dies together with mainSVG once it is
+    // detached below, but remove it explicitly in case the detached SVG is
+    // ever re-attached externally. Same stable reference as in clear().
+    this.mainSVG.removeEventListener('click', this.handleNoteClick);
+    setBlinkAnimation(this.overlayG, false); // Stop the signature blink animation
+    while (this.div.lastChild) {
+      this.div.removeChild(this.div.lastChild);
+    }
+    this.playingNotes.clear();
+    this.noteGroupCache.clear();
+    this.noteById.clear();
+    this.destroyed = true;
   }
 
   /** Updates SVG and container dimensions */
@@ -374,6 +435,7 @@ export class JianpuSVGRender {
     activeNote?: NoteInfo,
     scrollIntoView?: boolean
   ): number {
+    if (this.destroyed) return -1; // 已销毁：不绘制任何内容
     let activeNotePosition = -1;
     const isCompact = this.config.pixelsPerTimeStep <= 0;
 
@@ -384,7 +446,7 @@ export class JianpuSVGRender {
         // Deactivate previously playing notes that are not the current one
         this.playingNotes.forEach((_note, id) => { // Changed 'note' to '_note' as it's unused
             if (id !== noteId) {
-                const g = this.mainSVG.querySelector(`g[data-id="${id}"]`) as SVGGElement | null;
+                const g = this.getNoteGroup(id);
                 if (g) {
                     resetElementHighlight(g, this.config.noteColor);
                 }
@@ -394,7 +456,7 @@ export class JianpuSVGRender {
 
         // Activate the current note
         if (!this.playingNotes.has(noteId)) {
-             const g = this.mainSVG.querySelector(`g[data-id="${noteId}"]`) as SVGGElement | null;
+             const g = this.getNoteGroup(noteId);
              if (g) {
                 highlightElement(g, this.config.activeNoteColor);
                 this.playingNotes.set(noteId, activeNote);
@@ -514,6 +576,24 @@ export class JianpuSVGRender {
   }
 
   /**
+   * Looks up a note group by id, from the element cache. On a cache miss
+   * falls back to a single querySelector and backfills the cache (guards
+   * against incremental-draw ordering); returns null if still not found.
+   * @param noteId The note id in `${start}-${pitch}` form.
+   */
+  private getNoteGroup(noteId: string): SVGGElement | null {
+      let g = this.noteGroupCache.get(noteId) ?? null;
+      if (!g) {
+          g = this.mainSVG.querySelector(`g[data-id="${noteId}"]`) as SVGGElement | null;
+          if (g) {
+              this.noteGroupCache.set(noteId, g);
+          }
+      }
+      return g;
+  }
+
+
+  /**
    * Draws a single JianpuBlock (notes or rest) at the specified x-position.
    * @param block The JianpuBlock to draw.
    * @param x The horizontal starting position.
@@ -546,16 +626,44 @@ export class JianpuSVGRender {
            }
        }
 
+       // --- 1b. Draw Bar Number (optional) ---
+       // Drawn centered above the bar line position. Unlike the bar line
+       // itself, the number is also drawn for the first measure at time 0
+       // (which has no bar line): there it is left-aligned to the block
+       // start so it stays inside the SVG. Per engraving convention bar
+       // numbers do not participate in the block width calculation.
+       if (this.config.showBarNumbers && isMeasureStart) {
+           const isTimeZero = block.start <= 1e-6;
+           const barX = x - (isCompact ? this.estimatedNoteWidth * 0.6 : 4); // Same x as the bar line
+           const barNumberY = -this.config.noteHeight * 2.2; // Above the octave dots (highest ~ -1.9 * noteHeight)
+           drawSVGText(
+               this.musicG,
+               String(Math.round(block.measureNumber)), // Integer part is the measure number
+               isTimeZero ? x : barX,
+               barNumberY,
+               `${this.smallFontSize}px`,
+               'normal',
+               isTimeZero ? 'start' : 'middle',
+               'middle',
+               this.config.noteColor,
+               1,
+               this.config.fontFamily
+           );
+       }
+
 
        // --- 2. Draw Signatures (if changed, in-line only) ---
        // Overlay handles the *current* signature. This draws changes *within* the score flow.
+       // Each signature kind is drawn independently: only the ones that changed
+       // at this block start get drawn (e.g. a tempo change alone draws just "♩=qpm").
        const keyChanged = this.updateCurrentKey(block.start);
        const timeChanged = this.updateCurrentTimeSignature(block.start);
+       const tempoChanged = this.updateCurrentTempo(block.start);
        let signatureWidth = 0;
-       if ((keyChanged || timeChanged) && block.start > 1e-6) {
+       if ((keyChanged || timeChanged || tempoChanged) && block.start > 1e-6) {
             // Draw the new signature(s) in the signaturesG (scrollable part)
             const sigX = x + blockWidth; // Position it after potential bar line
-            signatureWidth = this.drawSignatures(this.signaturesG, sigX, keyChanged, timeChanged);
+            signatureWidth = this.drawSignatures(this.signaturesG, sigX, keyChanged, timeChanged, tempoChanged);
             if (isCompact) {
                  blockWidth += signatureWidth + this.estimatedNoteWidth * 0.2; // Add width and spacing
             }
@@ -649,6 +757,8 @@ private drawNotes(
         const noteId = noteElementId(note.start, note.pitch);
         // Group for individual note allows highlighting and tie linking
         const noteG = createSVGGroupChild(blockGroup, noteId);
+        this.noteGroupCache.set(noteId, noteG); // Cache for hot-path lookups
+        this.noteById.set(noteId, note); // noteId → note data, for click delegation
         if (block.isMeasureBeginning()) {
              noteG.setAttribute('data-is-measure-start', 'true'); // Mark for scrolling
         }
@@ -660,7 +770,7 @@ private drawNotes(
         if (note.accidental !== 0) {
             const accText = ACCIDENTAL_TEXT[note.accidental];
             // Position accidental slightly before the number
-            drawSVGText(noteG, accText, noteStartX + noteSpacing, 0, SMALL_FONT_SIZE, 'normal', 'end', 'text-top', this.config.noteColor);
+            drawSVGText(noteG, accText, noteStartX + noteSpacing, 0, SMALL_FONT_SIZE, 'normal', 'end', 'text-top', this.config.noteColor, 1, this.config.fontFamily);
             // We don't advance noteStartX here, accidental sits to the left
             // We do need its width to potentially adjust overall block spacing later if needed.
             //let accWidth = acc.getBBox().width;
@@ -693,7 +803,7 @@ private drawNotes(
         } else {
 
             const numText = `${note.jianpuNumber}`;
-            const num = drawSVGText(noteG, numText, noteStartX, 0, FONT_SIZE, 'normal', 'start', 'middle', this.config.noteColor);
+            const num = drawSVGText(noteG, numText, noteStartX, 0, FONT_SIZE, 'normal', 'start', 'middle', this.config.noteColor, 1, this.config.fontFamily);
             noteWidth = measureSVGTextWidth(num, numText, FONT_SIZE);
             noteEndX = noteStartX + noteWidth; // Number defines the main body width for now
           
@@ -798,6 +908,27 @@ private drawNotes(
                 markEl,
             };
         }
+
+        // --- Lyric ---
+        // Drawn under the note number (in the gap below the duration
+        // underlines). Continuation segments of augmentation dashes and other
+        // tied continuations (note.tiedFrom set) carry no lyric: the syllable
+        // stays on the first segment of the tie chain. Rest blocks never
+        // reach this loop (drawRest has no lyric handling).
+        if (note.lyric && !note.tiedFrom) {
+            const lyricY = this.config.noteHeight * LYRIC_OFFSET_FACTOR;
+            const lyricCenterX = noteStartX + noteWidth / 2;
+            const lyricText = drawSVGText(noteG, note.lyric, lyricCenterX, lyricY, SMALL_FONT_SIZE, 'normal', 'middle', 'middle', this.config.noteColor, 1, this.config.fontFamily);
+            // A lyric can be wider than its note: widen the note's right edge
+            // so the following note is spaced after the lyric instead of
+            // overlapping it.
+            const lyricWidth = lyricText.getBBox().width;
+            const lyricRightX = lyricCenterX + lyricWidth / 2;
+            if (lyricRightX > noteEndX) {
+                noteEndX = lyricRightX;
+            }
+        }
+
 
         // --- Ties ---
 
@@ -988,7 +1119,7 @@ private drawRest(block: JianpuBlock, x: number, blockGroup: SVGGElement): number
 
     // --- Rest Symbol ('0') ---
     const restSymbol = '0';
-    const restText = drawSVGText(blockGroup, restSymbol, currentX, 0, FONT_SIZE, 'normal', 'start', 'middle', this.config.noteColor);
+    const restText = drawSVGText(blockGroup, restSymbol, currentX, 0, FONT_SIZE, 'normal', 'start', 'middle', this.config.noteColor, 1, this.config.fontFamily);
     const restWidth = measureSVGTextWidth(restText, restSymbol, FONT_SIZE);
     noteEndX = currentX + restWidth;
 
@@ -1029,13 +1160,15 @@ private drawRest(block: JianpuBlock, x: number, blockGroup: SVGGElement): number
    * @param x The starting x position.
    * @param drawKey Draw the key signature (1=X).
    * @param drawTime Draw the time signature (X/Y).
+   * @param drawTempo Draw the tempo marking (♩=qpm) after the time signature.
    * @returns The width of the drawn signatures.
    */
    private drawSignatures(
        container: SVGGElement,
        x: number,
        drawKey: boolean,
-       drawTime: boolean
+       drawTime: boolean,
+       drawTempo = false
    ): number {
        let currentX = x;
        const spacing = this.estimatedNoteWidth * 0.3; // Spacing between elements
@@ -1049,7 +1182,7 @@ private drawRest(block: JianpuBlock, x: number, blockGroup: SVGGElement): number
            // spelling (Bb reads as A#). See KeySignatureInfo.label.
            const keyText = this.currentKeyLabel
                ?? `1=${PITCH_CLASS_NAMES[this.currentKey % 12] ?? 'C'}`;
-           const keySig = drawSVGText(container, keyText, currentX, 0, keyFontSize, 'normal', 'start', 'middle', this.config.noteColor);
+           const keySig = drawSVGText(container, keyText, currentX, 0, keyFontSize, 'normal', 'start', 'middle', this.config.noteColor, 1, this.config.fontFamily);
            // Fork: mark it so a host can hit-test the caption and edit in place.
            // Same idea as the stable `data-id` on note groups -- without a
            // handle these are anonymous <text> nodes and nothing can find them.
@@ -1061,18 +1194,41 @@ private drawRest(block: JianpuBlock, x: number, blockGroup: SVGGElement): number
        if (drawTime) {
             const timeStr = `${this.currentTimeSignature.numerator}/${this.currentTimeSignature.denominator}`;
             const timeSig = drawSVGText(
-                container, 
-                timeStr, 
-                currentX, 
+                container,
+                timeStr,
+                currentX,
                 0,  // 保持与基线对齐
-                timeFontSize, 
-                'normal', 
-                'start', 
+                timeFontSize,
+                'normal',
+                'start',
                 'middle',  // 垂直居中
-                this.config.noteColor
+                this.config.noteColor,
+                1,
+                this.config.fontFamily
             );
             timeSig.setAttribute('data-signature', 'time');   // Fork: see above
             currentX += timeSig.getBBox().width + spacing;
+       }
+
+       // --- Tempo Marking (e.g., ♩=96) ---
+       // The quarter-note glyph (U+2669) is written as plain text and relies on
+       // the browser's font fallback for display.
+       if (drawTempo) {
+            const tempoStr = `♩=${this.currentTempoQpm}`;
+            const tempoSig = drawSVGText(
+                container,
+                tempoStr,
+                currentX,
+                0,  // 保持与基线对齐
+                timeFontSize,
+                'normal',
+                'start',
+                'middle',  // 垂直居中
+                this.config.noteColor,
+                1,
+                this.config.fontFamily
+            );
+            currentX += tempoSig.getBBox().width + spacing;
        }
 
        const totalWidth = currentX - x;
@@ -1124,6 +1280,43 @@ private drawRest(block: JianpuBlock, x: number, blockGroup: SVGGElement): number
       return false;
   }
 
+  /** Updates the current tempo if changed at the given time */
+  private updateCurrentTempo(timeQ: number): boolean {
+      const newTempo = this.jianpuModel.measuresInfo.tempoAtQ(timeQ, true); // Check for exact change
+      if (newTempo !== -1 && newTempo !== this.currentTempoQpm) {
+          this.currentTempoQpm = newTempo;
+          return true;
+      }
+      return false;
+  }
+
+  /**
+   * Click handler using event delegation: instead of one listener per note
+   * group, a single 'click' listener on mainSVG walks from the clicked
+   * element up the parent chain and reports the first element whose data-id
+   * is a known note id (a key of noteById, filled by drawNotes).
+   *
+   * Other elements also carry a data-id — block groups ("block-<start>"),
+   * 'main-content', 'music', 'signatures', 'overlay' — but none of those ids
+   * is ever a note id, so the same lookup filters them out. The walk stops
+   * at mainSVG itself (the listener element, never a note). Clicks that hit
+   * no note (bar lines, signatures, empty space) are silently ignored.
+   */
+  private handleNoteClick = (event: MouseEvent): void => {
+    if (this.destroyed) return; // 已销毁：监听器本应已随 DOM 移除，防御外部复用 mainSVG 的极端情况
+    if (!this.config.onNoteClick) return; // No callback configured: ignore clicks entirely
+    let el = event.target as Element | null;
+    while (el && el !== this.mainSVG) {
+      const noteId = el.getAttribute('data-id');
+      const note = noteId === null ? undefined : this.noteById.get(noteId);
+      if (note) {
+        this.config.onNoteClick(note, el as SVGGElement); // Note groups are always <g data-id>
+        return;
+      }
+      el = el.parentElement;
+    }
+  };
+
   /** Handles scroll events to update the fixed signature overlay */
   private handleScrollEvent = (_event: Event) => {
     this.lastKnownScrollLeft = this.parentElement.scrollLeft;
@@ -1174,6 +1367,7 @@ private drawRest(block: JianpuBlock, x: number, blockGroup: SVGGElement): number
         const scrolledTimeQ = this.pixelsToTime(scrollLeft);
         const keyAtScroll = this.jianpuModel.measuresInfo.keySignatureAtQ(scrolledTimeQ);
         const timeSigAtScroll = this.jianpuModel.measuresInfo.timeSignatureAtQ(scrolledTimeQ) ?? this.currentTimeSignature;
+        const tempoAtScroll = this.jianpuModel.measuresInfo.tempoAtQ(scrolledTimeQ);
 
         let needsRedraw = false;
         if (keyAtScroll !== this.currentKey) {
@@ -1186,10 +1380,14 @@ private drawRest(block: JianpuBlock, x: number, blockGroup: SVGGElement): number
              this.currentTimeSignature = timeSigAtScroll;
              needsRedraw = true;
          }
+         if (tempoAtScroll !== this.currentTempoQpm) {
+             this.currentTempoQpm = tempoAtScroll;
+             needsRedraw = true;
+         }
 
         if (needsRedraw) {
             while (this.overlayG.lastChild) this.overlayG.removeChild(this.overlayG.lastChild);
-            this.drawSignatures(this.overlayG, 0, true, true);
+            this.drawSignatures(this.overlayG, 0, true, true, this.config.showTempoMarking);
             // Blinking logic on scroll update
              if (scrollLeft < 10 && this.config.pixelsPerTimeStep > 0) {
                   setBlinkAnimation(this.overlayG, true); this.signaturesBlinking = true;
@@ -1205,6 +1403,103 @@ private drawRest(block: JianpuBlock, x: number, blockGroup: SVGGElement): number
       if (this.config.pixelsPerTimeStep <= 0) return 0; // Not applicable in compact mode
       // Use start time 0 for tempo context for general scroll position
       return this.jianpuModel.measuresInfo.timeToQuarters(pixels / this.config.pixelsPerTimeStep, 0);
+  }
+
+  /**
+   * Exports the current score as a standalone, self-contained SVG string.
+   *
+   * The export is a deep clone of the live `mainSVG` (its width/height
+   * attributes come along with the clone), plus:
+   * - explicit xmlns / xmlns:xlink declarations so the file is valid
+   *   standalone XML even when parsed outside the serializer;
+   * - a white background `<rect>` inserted as the first child (an exported
+   *   SVG is transparent by default, which is unreadable on dark pages);
+   * - unless `includeOverlay` is false, the fixed signature overlay
+   *   (`overlayG`) cloned into a plain `<g>` right after the background rect,
+   *   so the key/time/tempo signatures currently shown by the overlay are
+   *   part of the exported file.
+   *
+   * Overlay alignment (verified against clear()/updateLayout()): overlaySVG
+   * is absolutely positioned at (0, 0) of the container div and mainSVG
+   * starts at (0, 0) of the same div, and neither SVG declares a viewBox, so
+   * both coordinate systems share a single origin with 1 unit = 1 px. The
+   * overlay signatures are drawn starting at x = 0
+   * (drawSignatures(this.overlayG, 0, ...)) — the same left edge the score
+   * content starts at — so the overlayG clone needs no extra translation:
+   * its own transform `translate(0, this.yBaseline)` already reproduces the
+   * on-screen vertical offset (the score itself sits lower still, since
+   * mainG carries `translate(0, yBaseline + verticalPadding)`). Signature
+   * band and score content are therefore vertically disjoint by design,
+   * which is also why placing the overlay clone below the score group in
+   * paint order does not change the visible result.
+   *
+   * Note: the returned string is a snapshot of the *current* DOM. Playback
+   * state — e.g. the active-note highlight color, or the signature blink
+   * animation while it is running — is baked into the export as-is.
+   *
+   * @param includeOverlay Whether to include the fixed signature overlay in
+   *     the export. Defaults to true.
+   * @returns The standalone SVG markup, or an empty string if the renderer
+   *     was already destroy()ed (the SVG structure is gone, nothing to
+   *     serialize).
+   */
+  public toSVGString(includeOverlay = true): string {
+    if (this.destroyed) return ''; // 已销毁：SVG 结构已释放，返回空字符串
+    const exportSVG = this.mainSVG.cloneNode(true) as SVGSVGElement;
+
+    // XMLSerializer normally emits namespace declarations on its own, but set
+    // them explicitly as a safety net for standalone consumption.
+    exportSVG.setAttribute('xmlns', SVGNS);
+    exportSVG.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink');
+
+    // Defensive: updateLayout() always sets the width/height attributes on
+    // mainSVG and cloneNode copies attributes, but fall back to the current
+    // instance values should the attributes ever be missing.
+    if (!exportSVG.getAttribute('width')) {
+      exportSVG.setAttribute('width', `${this.width}`);
+    }
+    if (!exportSVG.getAttribute('height')) {
+      exportSVG.setAttribute('height', `${this.height}`);
+    }
+
+    // White background first, so it paints below everything else.
+    const background = document.createElementNS(SVGNS, 'rect');
+    background.setAttribute('width', '100%');
+    background.setAttribute('height', '100%');
+    background.setAttribute('fill', 'white');
+    exportSVG.insertBefore(background, exportSVG.firstChild);
+
+    // Overlay clone goes after the background and before the score content
+    // (background.nextSibling is the cloned mainG).
+    if (includeOverlay) {
+      const overlayWrapper = document.createElementNS(SVGNS, 'g');
+      overlayWrapper.appendChild(this.overlayG.cloneNode(true));
+      exportSVG.insertBefore(overlayWrapper, background.nextSibling);
+    }
+
+    return new XMLSerializer().serializeToString(exportSVG);
+  }
+
+  /**
+   * Exports the current score via {@link toSVGString} and triggers a browser
+   * download of it as an .svg file. Does nothing after destroy().
+   * @param filename Suggested file name for the download. Defaults to
+   *     'jianpu-score.svg'.
+   */
+  public downloadSVG(filename = 'jianpu-score.svg'): void {
+    if (this.destroyed) return; // 已销毁：无内容可下载
+    const svgString = this.toSVGString();
+    if (!svgString) return; // Defensive: nothing to write
+    const blob = new Blob([svgString], { type: 'image/svg+xml;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    link.style.display = 'none'; // 隐藏的 <a download>，仅用于触发下载
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
   }
 
 }
