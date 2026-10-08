@@ -121,6 +121,13 @@ export class JianpuBlock {
    augmentationDots?: number;
    /** True if an augmentation dash is needed (for notes longer than quarter) */
    augmentationDash?: boolean; // Simple flag for now
+   /**
+    * How the block is written, when it comes from a token of a written score
+    * (SumisoraOMR fork addition, see `JianpuInfo.slots`). When set,
+    * calculateRenderProperties() takes the underlines, dots and dash from here
+    * instead of deriving them from the block's length.
+    */
+   written?: { lines: number; dots: number; dash: boolean };
 
 
   // --- Rhythmic Properties (calculated during processing) ---
@@ -298,6 +305,31 @@ export class JianpuBlock {
   }
 
   /**
+   * Marks `beatBegin` and `beatEnd` for the block as it is, without splitting
+   * it. The renderer leaves a full gap after a block that ends a beat or a
+   * measure, and a narrower one otherwise.
+   *
+   * Split out of splitToBeat() (SumisoraOMR fork) so a block that is one
+   * written token -- which must stay whole -- gets the same spacing.
+   * @param measuresInfo Provides measure and beat context.
+   */
+  public markBeatBounds(measuresInfo: MeasuresInfo): void {
+      const timeSignature = measuresInfo.timeSignatureAtQ(this.start);
+      if (!timeSignature) return;
+      const measureLength = measuresInfo.measureLengthAtQ(this.start);
+      const measureNum = measuresInfo.measureNumberAtQ(this.start);
+      const measureStart = this.start - (measureNum - Math.floor(measureNum)) * measureLength;
+      const timeInMeasure = this.start - measureStart;
+      const beatLength = 4 / timeSignature.denominator;
+
+      const startBeatFraction = timeInMeasure / beatLength;
+      this.beatBegin = isSafeZero(startBeatFraction - Math.round(startBeatFraction));
+      const endBeatFraction = (timeInMeasure + this.length) / beatLength;
+      this.beatEnd = isSafeZero(endBeatFraction - Math.round(endBeatFraction))
+          || isSafeZero(this.start + this.length - (measureStart + measureLength));
+  }
+
+  /**
    * Splits the block, if necessary, so the first part ends at the next beat boundary.
    * Marks `beatBegin` and `beatEnd` properties.
    * @param measuresInfo Provides measure and beat context.
@@ -354,12 +386,7 @@ export class JianpuBlock {
       } else {
           // No split needed within the block based on beats/measure end.
           // Check if the block *already* ends on a beat boundary.
-          const endBeatFraction = (timeInMeasure + this.length) / beatLength;
-          this.beatEnd = isSafeZero(endBeatFraction - Math.round(endBeatFraction));
-          // Also check if it ends exactly at measure end
-          if (!this.beatEnd) {
-              this.beatEnd = isSafeZero(blockEndTime - measureEndTime);
-          }
+          this.markBeatBounds(measuresInfo);
       }
 
        // Set tie properties based on notes
@@ -390,6 +417,14 @@ export class JianpuBlock {
         delete this.durationLines;
         delete this.augmentationDots;
         delete this.augmentationDash;
+
+        // Fork: a block that is one written token is drawn as written.
+        if (this.written) {
+            this.durationLines = this.written.lines;
+            this.augmentationDots = this.written.dots;
+            this.augmentationDash = this.written.dash;
+            return;
+        }
     
         const blockLength = this.length;
         if (isSafeZero(blockLength) || blockLength < 0) return;

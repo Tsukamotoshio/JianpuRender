@@ -16,7 +16,7 @@
  */
 
 import {
-    JianpuInfo, NoteInfo, KeySignatureInfo, LyricInfo,
+    JianpuInfo, NoteInfo, KeySignatureInfo, LyricInfo, SlotInfo,
     DEFAULT_TEMPO, DEFAULT_TIME_SIGNATURE, DEFAULT_KEY_SIGNATURE
   } from './jianpu_info';
   import { MeasuresInfo } from './measure_info';
@@ -120,7 +120,11 @@ import {
           [...jianpuInfo.lyrics].sort((a, b) => a.start - b.start) : [];
 
       this.measuresInfo = new MeasuresInfo(jianpuInfo, this.lastQ);
-      this.infoToBlocks(sortedLyrics);
+      if (jianpuInfo.slots && jianpuInfo.slots.length) {
+          this.slotsToBlocks(jianpuInfo.slots, sortedLyrics);
+      } else {
+          this.infoToBlocks(sortedLyrics);
+      }
     }
   
     /**
@@ -181,41 +185,127 @@ import {
   
       this.jianpuBlockMap = new Map();
       const sortedStartsFromRaw = Array.from(rawBlocks.keys()).sort((a, b) => a - b);
-      let blockProcessingQueue: JianpuBlock[] = [];
-      sortedStartsFromRaw.forEach(start => {
-          blockProcessingQueue.push(rawBlocks.get(start)!);
+      this.splitIntoSymbols(sortedStartsFromRaw.map(start => rawBlocks.get(start)!), this.jianpuBlockMap);
+
+      this.jianpuBlockMap.forEach((block) => {
+          block.calculateRenderProperties(this.measuresInfo);
       });
-  
-      const processedBlocksForSplitting = new Set<number>();
-  
+    }
+
+    /**
+     * Splits blocks at beats and into standard symbol lengths, merging the
+     * pieces into `into`. `blocks` must be sorted by start.
+     */
+    private splitIntoSymbols(blocks: JianpuBlock[], into: JianpuBlockMap): void {
+      const blockProcessingQueue: JianpuBlock[] = [...blocks];
       while (blockProcessingQueue.length > 0) {
-          let currentBlock = blockProcessingQueue.shift()!;
-  
-          if (processedBlocksForSplitting.has(currentBlock.start) && this.jianpuBlockMap.has(currentBlock.start)) {
-              // Block might have been re-added after a split, potentially merged already.
-              // mergeToMap should handle updates if necessary.
-          }
-  
-          let remainingBeatSplit = currentBlock.splitToBeat(this.measuresInfo);
+          const currentBlock = blockProcessingQueue.shift()!;
+
+          const remainingBeatSplit = currentBlock.splitToBeat(this.measuresInfo);
           if (remainingBeatSplit) {
-              currentBlock.mergeToMap(this.jianpuBlockMap);
-              processedBlocksForSplitting.add(currentBlock.start);
+              currentBlock.mergeToMap(into);
               blockProcessingQueue.unshift(remainingBeatSplit);
               continue;
           }
-  
+
           let blockToSymbolSplit = currentBlock;
           let remainingSymbolSplit : JianpuBlock | null = null;
           do {
               remainingSymbolSplit = blockToSymbolSplit.splitToStandardSymbol(this.measuresInfo);
-              blockToSymbolSplit.mergeToMap(this.jianpuBlockMap);
-              processedBlocksForSplitting.add(blockToSymbolSplit.start);
+              blockToSymbolSplit.mergeToMap(into);
               if (remainingSymbolSplit) {
                   blockToSymbolSplit = remainingSymbolSplit;
               }
            } while(remainingSymbolSplit);
       }
-  
+    }
+
+    /**
+     * Fork (SumisoraOMR): builds the blocks from the written tokens instead of
+     * re-deriving a notation from note timings. Each note, and each `-` that
+     * continues it, becomes exactly one block drawn the way its token is
+     * written; nothing is split at beats, so `6 - q- q6` stays four blocks and
+     * a sustained note is never drawn as repeated tied digits.
+     *
+     * A `-` gets a note of its own -- same pitch, no accidental, no mark, and
+     * no tie link to the note it continues: the dash *is* the sustain, so no
+     * tie arc may be drawn, and lyrics and dynamics stay on the attack.
+     * A note lengthened by an edit (`dashes` > 0) is a head plus that many
+     * one-beat dash blocks, as the serializer writes it.
+     *
+     * Rests -- including the `-` that lengthen them -- are still filled in and
+     * split by the upstream rules; they get the same treatment as notes in a
+     * later step.
+     */
+    private slotsToBlocks(slots: SlotInfo[], sortedLyrics: LyricInfo[]): void {
+      const lyricCursor = { index: 0 };
+      const noteAt = new Map<string, NoteInfo>();
+      this.jianpuInfo.notes.forEach(n => noteAt.set(n.start.toFixed(6), n));
+
+      const blocks: JianpuBlock[] = [];
+      const addBlock = (start: number, length: number, note: JianpuNote,
+                        lines: number, dots: number, dash: boolean) => {
+          const block = new JianpuBlock(start, length, [note], this.measuresInfo.measureNumberAtQ(start));
+          block.written = { lines, dots, dash };
+          block.markBeatBounds(this.measuresInfo);   // spacing: a full gap after the end of a beat
+          blocks.push(block);
+      };
+      const dashNote = (of: JianpuNote, start: number, length: number): JianpuNote => ({
+          start, length, pitch: of.pitch, intensity: of.intensity,
+          jianpuNumber: of.jianpuNumber, octaveDot: of.octaveDot, accidental: 0,
+      });
+
+      // 下一个 `-` 延续的那个音：遇到音符就是它，遇到休止或画不出来的音就清空——
+      // 休止后面的 `-` 属于休止，留给下面的补休止逻辑。
+      let held: JianpuNote | null = null;
+      for (const slot of slots) {
+          if (slot.is_rest) { held = null; continue; }
+          if (slot.is_dash) {
+              if (held) {
+                  addBlock(slot.start, slot.duration, dashNote(held, slot.start, slot.duration),
+                           slot.lines, slot.dots, true);
+              }
+              continue;
+          }
+          const info = noteAt.get(slot.start.toFixed(6));
+          if (!info) { held = null; continue; }
+          const headLength = slot.duration - slot.dashes;
+          const note = this.createJianpuNote({ ...info, length: headLength },
+                                             this.measuresInfo.keySignatureAtQ(slot.start));
+          const lyric = this.nextLyricForNote(info, sortedLyrics, lyricCursor);
+          if (lyric) {
+              note.lyric = lyric.text;
+          }
+          addBlock(slot.start, headLength, note, slot.lines, slot.dots, false);
+          for (let k = 0; k < slot.dashes; k++) {
+              const start = slot.start + headLength + k;
+              addBlock(start, 1, dashNote(note, start, 1), 0, 0, true);
+          }
+          held = note;
+      }
+
+      // 补休止：token 块没覆盖到的时间段，按上游原来的规则切开。
+      const gaps: JianpuBlock[] = [];
+      const end = this.lastQ - 1e-6;
+      let covered = 0;
+      for (const block of blocks) {
+          if (block.start > covered + 1e-6) {
+              gaps.push(new JianpuBlock(covered, block.start - covered, [],
+                                        this.measuresInfo.measureNumberAtQ(covered)));
+          }
+          covered = Math.max(covered, block.start + block.length);
+      }
+      if (end > covered + 1e-6) {
+          gaps.push(new JianpuBlock(covered, end - covered, [], this.measuresInfo.measureNumberAtQ(covered)));
+      }
+      const rests: JianpuBlockMap = new Map();
+      this.splitIntoSymbols(gaps, rests);
+
+      // The renderer walks the map in insertion order, so insert by start.
+      // Array.from, not spread: the ES5 build has no downlevelIteration, and
+      // spreading a Map iterator there silently yields nothing.
+      const ordered = blocks.concat(Array.from(rests.values())).sort((a, b) => a.start - b.start);
+      this.jianpuBlockMap = new Map(ordered.map(block => [block.start, block]));
       this.jianpuBlockMap.forEach((block) => {
           block.calculateRenderProperties(this.measuresInfo);
       });

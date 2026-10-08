@@ -142,6 +142,39 @@ export interface JianpuInfo {
    * notes themselves, so it can only ever extend the score, never truncate it.
    */
   totalLength?: number;
+  /**
+   * The written score, one entry per token, in order -- when the caller has
+   * one (SumisoraOMR fork addition).
+   *
+   * With slots, each note and each `-` that continues it is drawn as exactly
+   * the token the text has (`6 - q- q6` as a 6, a dash, an underlined dash and
+   * an underlined 6) instead of a notation re-derived from note timings, which
+   * splits at beats and draws a sustained note as repeated tied digits.
+   * `notes` still supplies pitch, dynamics and the written digit; a slot is
+   * matched to its note by start. Without slots nothing changes.
+   */
+  slots?: SlotInfo[];
+}
+
+/**
+ * One token of the written score (SumisoraOMR fork addition, see
+ * `JianpuInfo.slots`). Field names follow the producer's JSON.
+ */
+export interface SlotInfo {
+  /** Start of the token, in quarter notes */
+  start: number;
+  /** Length of the token, in quarter notes (a note's head plus its `dashes`) */
+  duration: number;
+  /** A `0` */
+  is_rest: boolean;
+  /** A `-` continuing whatever precedes it */
+  is_dash: boolean;
+  /** Underlines: 1 for `q`, 2 for `s`, 3 for `d` */
+  lines: number;
+  /** Augmentation dots: 1 for a trailing `.` */
+  dots: number;
+  /** Dashes written after a note longer than a dotted quarter (`1 -` is 1) */
+  dashes: number;
 }
 
 /** Default tempo in case none is found (60 bpm) */
