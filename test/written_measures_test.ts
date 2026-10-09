@@ -25,19 +25,28 @@ import { JianpuModel } from '../src/jianpu_model';
 import { JianpuBlock } from '../src/jianpu_block';
 import { computeBeamGroups } from '../src/beam_grouping';
 
-/** A token: a note `n` or a rest `0`, with its duration and underlines. */
-type Tok = [kind: 'n' | '0', duration: number, lines?: number];
+/** A token: a note `n`, a rest `0` or a dash `-`, with its duration and underlines. */
+type Tok = [kind: 'n' | '0' | '-', duration: number, lines?: number];
 
 /** A score from written measures; every slot carries its measure. */
-function score(measures: Tok[][], numerator = 4, denominator = 4, withRef = true): JianpuInfo {
+function score(measures: Tok[][], numerator = 4, denominator = 4, withRef = true,
+               noteExtra: Partial<NoteInfo> = {}): JianpuInfo {
   const notes: NoteInfo[] = [];
   const slots: SlotInfo[] = [];
   let t = 0;
+  let held: NoteInfo | null = null;
   measures.forEach((toks, m) => toks.forEach(([kind, duration, lines = 0], index) => {
-    const slot: SlotInfo = { start: t, duration, is_rest: kind === '0', is_dash: false, lines, dots: 0, dashes: 0 };
+    const slot: SlotInfo = { start: t, duration, is_rest: kind === '0', is_dash: kind === '-', lines, dots: 0, dashes: 0 };
     if (withRef) slot.ref = { measure: m, index };
     slots.push(slot);
-    if (kind === 'n') notes.push({ start: t, length: duration, pitch: 60 + slots.length, intensity: 80, jianpuNumber: 1 });
+    if (kind === 'n') {
+      held = { start: t, length: duration, pitch: 60 + slots.length, intensity: 80, jianpuNumber: 1, ...noteExtra };
+      notes.push(held);
+    } else if (kind === '-' && held) {
+      held.length += duration;
+    } else if (kind === '0') {
+      held = null;
+    }
     t += duration;
   }));
   return {
@@ -116,5 +125,62 @@ test('written measures: rests are split on the written beats, not the time grid'
   const blocks = blocksOf(score([[['n', 0.5, 1]], [['0', 1], ['n', 1]]], 2, 4));
   const rests = blocks.filter((b) => b.notes.length === 0);
   t.deepEqual(rests.map((b) => [b.start, b.length]), [[0.5, 1]]);
+  t.end();
+});
+
+// ── a note held across a barline is printed again, tied (stage V1h) ─────────
+
+const blockAt = (blocks: JianpuBlock[], s: number) => blocks.find((b) => Math.abs(b.start - s) < 1e-6)!;
+
+test('held across a barline: the `-` opening the measure is the note again, tied', (t: test.Test) => {
+  // `1 - - - | - - 2 2`, which jianpu-ly prints as `1 - - -⌒| 1 - 2 2`.
+  const blocks = blocksOf(score([[['n', 1], ['-', 1], ['-', 1], ['-', 1]], [['-', 1], ['-', 1], ['n', 1], ['n', 1]]]));
+  const head = blockAt(blocks, 0).notes[0];
+  const again = blockAt(blocks, 4);
+  t.equal(again.notes.length, 1, 'a note');
+  t.notOk(again.augmentationDash, 'drawn as a digit, not a dash');
+  t.equal(again.notes[0].writtenTieFrom, head, 'tied from the head');
+  t.equal(head.writtenTieTo, again.notes[0], 'and the head knows it');
+  t.ok(blockAt(blocks, 5).augmentationDash, 'the next `-` in that measure is a dash again');
+  t.end();
+});
+
+test('held across a barline: the repeat carries the accidental and octave dots', (t: test.Test) => {
+  const blocks = blocksOf(score([[['n', 1], ['-', 1], ['-', 1], ['-', 1]], [['-', 1], ['n', 1], ['n', 1], ['n', 1]]],
+    4, 4, true, { accidental: 1, octaveDot: 1, jianpuNumber: 4 }));
+  const again = blockAt(blocks, 4).notes[0];
+  t.deepEqual([again.jianpuNumber, again.accidental, again.octaveDot], [4, 1, 1], '#4 with a dot above, as the head');
+  t.end();
+});
+
+test('held across a barline: the repeat keeps the underline of the dash it replaces', (t: test.Test) => {
+  // `q4, q- | q- q5`: printed `4 -⌒| 4 5` with the repeated 4 underlined.
+  const blocks = blocksOf(score([[['n', 1], ['n', 1], ['n', 1], ['n', 0.5, 1], ['-', 0.5, 1]], [['-', 0.5, 1], ['n', 0.5, 1], ['n', 1], ['n', 1], ['n', 1]]]));
+  const again = blockAt(blocks, 4);
+  t.equal(again.notes.length, 1, 'printed as the note');
+  t.equal(again.durationLines, 1, 'with one underline');
+  t.end();
+});
+
+test('held across a barline: a rest held across one stays a dash', (t: test.Test) => {
+  const blocks = blocksOf(score([[['0', 1], ['-', 1], ['-', 1], ['-', 1]], [['-', 1], ['-', 1], ['n', 1], ['n', 1]]]));
+  const b = blockAt(blocks, 4);
+  t.equal(b.notes.length, 0, 'still part of the rest');
+  t.ok(b.augmentationDash, 'drawn as a dash');
+  t.end();
+});
+
+test('held across two barlines: each repeat is tied to the digit before it', (t: test.Test) => {
+  const blocks = blocksOf(score([
+    [['n', 1], ['-', 1], ['-', 1], ['-', 1]], [['-', 1], ['-', 1], ['-', 1], ['-', 1]], [['-', 1], ['n', 1], ['n', 1], ['n', 1]]]));
+  const [head, first, second] = [0, 4, 8].map((s) => blockAt(blocks, s).notes[0]);
+  t.equal(first.writtenTieFrom, head, 'first repeat tied from the head');
+  t.equal(second.writtenTieFrom, first, 'second repeat tied from the first, not the head');
+  t.end();
+});
+
+test('held across a barline: without measures in the slots the dash stays a dash', (t: test.Test) => {
+  const blocks = blocksOf(score([[['n', 1], ['-', 1], ['-', 1], ['-', 1]], [['-', 1], ['n', 1], ['n', 1], ['n', 1]]], 4, 4, false));
+  t.ok(blockAt(blocks, 4).augmentationDash);
   t.end();
 });

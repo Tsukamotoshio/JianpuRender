@@ -979,7 +979,27 @@ private drawNotes(
             }
         }
 
-
+        // --- Fork: a tie between two written digits (a note held across a
+        // barline, printed again after it as jianpu-ly does). Each tie joins
+        // one digit to the next, so a note held over two barlines gets two.
+        if (note.writtenTieFrom) {
+            const prevLink = linkedNoteMap.get(note.writtenTieFrom);
+            if (prevLink) {
+                const tieStartX = prevLink.xNoteRight;
+                const tieWidth = (noteStartX - noteSpacing) - tieStartX;
+                if (tieWidth > 1) {
+                    drawSVGPath(prevLink.g, tiePath,
+                                tieStartX - (prevLink.g.getCTM()?.e ?? 0),
+                                -this.config.noteHeight * 1.2,
+                                tieWidth / PATH_SCALE * 1.3,
+                                (this.config.noteHeight / PATH_SCALE) * 1.6);
+                }
+                linkedNoteMap.delete(note.writtenTieFrom);
+            }
+        }
+        if (note.writtenTieTo) {
+            linkedNoteMap.set(note, { g: noteG, xNoteRight: noteEndX, yNoteBaseline: 0 });
+        }
 
          maxX = Math.max(maxX, noteEndX); // Update the overall rightmost edge relative to block start 'x'
 

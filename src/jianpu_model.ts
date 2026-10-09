@@ -288,10 +288,13 @@ import {
       // 下一个 `-` 延续的是什么：一个音（held），一个休止（afterRest），或什么都不是
       // （段首、画不出来的音之后）——最后这种留给下面的补休止逻辑。
       let held: JianpuNote | null = null;
+      // 上一个画成数字的音（音头，或它在前面小节被重印的那个），新重印的数字从它连线。
+      let lastDigit: JianpuNote | null = null;
       let afterRest = false;
       for (const slot of slots) {
           if (slot.is_rest) {
               held = null;
+              lastDigit = null;
               afterRest = true;
               const headLength = slot.duration - slot.dashes;
               addBlock(slot.start, headLength, null, slot.lines, slot.dots, false);
@@ -301,7 +304,20 @@ import {
               continue;
           }
           if (slot.is_dash) {
-              if (held) {
+              if (held && lastDigit && slot.ref && slot.ref.index === 0) {
+                  // jianpu-ly 的印法：开启一个小节、延续一个音的 `-` 印成那个音本身（数字、
+                  // 升降号、八度点照音头，下划线与附点照这个 `-`），并与前一个数字连线。
+                  // 同小节其后的 `-` 仍是横线；延续休止的 `-` 不受影响。
+                  const again: JianpuNote = {
+                      start: slot.start, length: slot.duration, pitch: held.pitch,
+                      intensity: held.intensity, jianpuNumber: held.jianpuNumber,
+                      octaveDot: held.octaveDot, accidental: held.accidental,
+                      writtenTieFrom: lastDigit,
+                  };
+                  lastDigit.writtenTieTo = again;
+                  addBlock(slot.start, slot.duration, again, slot.lines, slot.dots, false);
+                  lastDigit = again;
+              } else if (held) {
                   addBlock(slot.start, slot.duration, dashNote(held, slot.start, slot.duration),
                            slot.lines, slot.dots, true);
               } else if (afterRest) {
@@ -311,7 +327,7 @@ import {
           }
           afterRest = false;
           const info = noteAt.get(slot.start.toFixed(6));
-          if (!info) { held = null; continue; }
+          if (!info) { held = null; lastDigit = null; continue; }
           const headLength = slot.duration - slot.dashes;
           const note = this.createJianpuNote({ ...info, length: headLength },
                                              this.measuresInfo.keySignatureAtQ(slot.start));
@@ -325,6 +341,7 @@ import {
               addBlock(start, 1, dashNote(note, start, 1), 0, 0, true);
           }
           held = note;
+          lastDigit = note;
       }
 
       // 补休止：token 块没覆盖到的时间段，先在文本小节线处切开（每条小节线前都要有块，

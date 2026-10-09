@@ -44,6 +44,16 @@ export interface JianpuNote extends NoteInfo {
   tiedFrom?: JianpuNote;
   /** Reference to following tied note */
   tiedTo?: JianpuNote;
+  /**
+   * The written digit this one is tied from: a note held across a barline is
+   * printed again after the barline, tied to the digit before it (SumisoraOMR
+   * fork addition; see slotsToBlocks). Kept apart from tiedFrom/tiedTo, whose
+   * upstream drawing walks a whole chain back to its first note -- here each
+   * tie joins exactly two neighbouring digits.
+   */
+  writtenTieFrom?: JianpuNote;
+  /** The written digit this one is tied to (the other end of writtenTieFrom). */
+  writtenTieTo?: JianpuNote;
   /** Lyric syllable attached to this note (undefined when the note carries no lyric) */
   lyric?: string;
 
