@@ -175,6 +175,13 @@ export interface SlotInfo {
   dots: number;
   /** Dashes written after a note longer than a dotted quarter (`1 -` is 1) */
   dashes: number;
+  /**
+   * Which measure of the text the token is in (0-based) and its place in it.
+   * With it, barlines, beat spacing and beam groups follow the measures as
+   * written -- a pickup, or an over- or underfull measure in OMR output --
+   * instead of measures re-derived from the time signature.
+   */
+  ref?: { measure: number; index: number };
 }
 
 /** Default tempo in case none is found (60 bpm) */

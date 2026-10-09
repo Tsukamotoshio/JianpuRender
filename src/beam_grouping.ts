@@ -74,7 +74,10 @@ export function beamBeatLengthQL(timeSignature: TimeSignatureInfo): number {
  * length unconditionally, which is only correct for simple time and would
  * mis-group compound time signatures — see module docs).
  */
-function timeInMeasure(measuresInfo: MeasuresInfo, time: number): number {
+function timeInMeasure(measuresInfo: MeasuresInfo, block: JianpuBlock): number {
+  // Fork: a block that knows its written measure counts from there.
+  if (block.measureStartQ !== undefined) return block.start - block.measureStartQ;
+  const time = block.start;
   const measureNumber = measuresInfo.measureNumberAtQ(time);
   const measureLength = measuresInfo.measureLengthAtQ(time);
   const fractional = measureNumber - Math.floor(measureNumber);
@@ -120,8 +123,8 @@ export function computeBeamGroups(
     const timeSignature = measuresInfo.timeSignatureAtQ(block.start)
       ?? { start: 0, numerator: 4, denominator: 4 };
     const beatLength = beamBeatLengthQL(timeSignature);
-    const measureLength = measuresInfo.measureLengthAtQ(block.start);
-    const endInMeasure = timeInMeasure(measuresInfo, block.start) + block.length;
+    const measureLength = block.measureLengthQ ?? measuresInfo.measureLengthAtQ(block.start);
+    const endInMeasure = timeInMeasure(measuresInfo, block) + block.length;
 
     const beatsFromMeasureStart = endInMeasure / beatLength;
     const atBeatBoundary = isSafeZero(beatsFromMeasureStart - Math.round(beatsFromMeasureStart));

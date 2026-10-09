@@ -242,11 +242,38 @@ import {
       const noteAt = new Map<string, NoteInfo>();
       this.jianpuInfo.notes.forEach(n => noteAt.set(n.start.toFixed(6), n));
 
+      // 文本里的小节：每个小节从它的第一个 token 开始，长度是它所有 token 时值之和。
+      // 小节线、拍位（块后留空）、连梁分组都按它算——弱起、OMR 产出的超拍/欠拍小节
+      // 都按写的来，而不是按拍号从 0 推出来的时间网格。
+      const measures: { start: number; length: number }[] = [];
+      let lastMeasure = -1;
+      for (const slot of slots) {
+          if (!slot.ref) { measures.length = 0; break; }   // 不带小节信息：退回按拍号推
+          if (slot.ref.measure !== lastMeasure) {
+              measures.push({ start: slot.start, length: 0 });
+              lastMeasure = slot.ref.measure;
+          }
+          measures[measures.length - 1].length += slot.duration;
+      }
+      const placeInMeasure = (block: JianpuBlock) => {
+          if (!measures.length) return;
+          let i = 0;
+          while (i + 1 < measures.length && measures[i + 1].start <= block.start + 1e-6) i++;
+          const m = measures[i];
+          block.measureStartQ = m.start;
+          block.measureLengthQ = m.length;
+          // 整数部分是小节号（1 起），小数部分是在小节里的位置——与上游 measureNumber
+          // 的含义一致，isMeasureBeginning() 和小节号绘制因此直接按文本走。
+          const into = m.length > 1e-9 ? (block.start - m.start) / m.length : 0;
+          block.measureNumber = i + 1 + (Math.abs(into) < 1e-6 ? 0 : into);
+      };
+
       const blocks: JianpuBlock[] = [];
       const addBlock = (start: number, length: number, note: JianpuNote,
                         lines: number, dots: number, dash: boolean) => {
           const block = new JianpuBlock(start, length, [note], this.measuresInfo.measureNumberAtQ(start));
           block.written = { lines, dots, dash };
+          placeInMeasure(block);
           block.markBeatBounds(this.measuresInfo);   // spacing: a full gap after the end of a beat
           blocks.push(block);
       };
@@ -284,22 +311,29 @@ import {
           held = note;
       }
 
-      // 补休止：token 块没覆盖到的时间段，按上游原来的规则切开。
+      // 补休止：token 块没覆盖到的时间段，先在文本小节线处切开（每条小节线前都要有块，
+      // 小节线才画得出来），再按上游原来的规则切。
       const gaps: JianpuBlock[] = [];
       const end = this.lastQ - 1e-6;
+      const addGap = (from: number, to: number) => {
+          const cuts = measures.map(m => m.start).filter(t => t > from + 1e-6 && t < to - 1e-6);
+          [from, ...cuts].forEach((s, k) => {
+              const e = k < cuts.length ? cuts[k] : to;
+              gaps.push(new JianpuBlock(s, e - s, [], this.measuresInfo.measureNumberAtQ(s)));
+          });
+      };
       let covered = 0;
       for (const block of blocks) {
-          if (block.start > covered + 1e-6) {
-              gaps.push(new JianpuBlock(covered, block.start - covered, [],
-                                        this.measuresInfo.measureNumberAtQ(covered)));
-          }
+          if (block.start > covered + 1e-6) addGap(covered, block.start);
           covered = Math.max(covered, block.start + block.length);
       }
-      if (end > covered + 1e-6) {
-          gaps.push(new JianpuBlock(covered, end - covered, [], this.measuresInfo.measureNumberAtQ(covered)));
-      }
+      if (end > covered + 1e-6) addGap(covered, end);
+      // 切之前先定位到文本小节：拍点从文本小节起点数，切出的碎片继承同一小节。
+      gaps.forEach(placeInMeasure);
       const rests: JianpuBlockMap = new Map();
       this.splitIntoSymbols(gaps, rests);
+      // 切分时上游按拍号给新块算了小节号；这里统一改成文本小节。
+      rests.forEach(placeInMeasure);
 
       // The renderer walks the map in insertion order, so insert by start.
       // Array.from, not spread: the ES5 build has no downlevelIteration, and

@@ -128,6 +128,14 @@ export class JianpuBlock {
     * instead of deriving them from the block's length.
     */
    written?: { lines: number; dots: number; dash: boolean };
+   /**
+    * Start and length (quarters) of the written measure this block is in,
+    * when the score comes with one (SumisoraOMR fork addition, see
+    * `SlotInfo.ref`). Beat positions and beam groups are then counted from
+    * here rather than from the time signature's idea of where measures fall.
+    */
+   measureStartQ?: number;
+   measureLengthQ?: number;
 
 
   // --- Rhythmic Properties (calculated during processing) ---
@@ -278,6 +286,9 @@ export class JianpuBlock {
 
     // Add the newly created note parts to the split block
     notesForNewBlock.forEach(note => splittedBlock.addNote(note));
+    // Fork: both halves lie in the same written measure.
+    splittedBlock.measureStartQ = this.measureStartQ;
+    splittedBlock.measureLengthQ = this.measureLengthQ;
 
     // Update the original block's length
     this.length = newBlockLength;
@@ -305,6 +316,21 @@ export class JianpuBlock {
   }
 
   /**
+   * Start and length (quarters) of the measure this block is in: the written
+   * measure when the block knows it (SumisoraOMR fork, see `measureStartQ`),
+   * otherwise the one the time signature implies.
+   * @param measuresInfo Provides measure context.
+   */
+  public measureSpan(measuresInfo: MeasuresInfo): { start: number; length: number } {
+      if (this.measureStartQ !== undefined && this.measureLengthQ !== undefined) {
+          return { start: this.measureStartQ, length: this.measureLengthQ };
+      }
+      const length = measuresInfo.measureLengthAtQ(this.start);
+      const measureNum = measuresInfo.measureNumberAtQ(this.start);
+      return { start: this.start - (measureNum - Math.floor(measureNum)) * length, length };
+  }
+
+  /**
    * Marks `beatBegin` and `beatEnd` for the block as it is, without splitting
    * it. The renderer leaves a full gap after a block that ends a beat or a
    * measure, and a narrower one otherwise.
@@ -316,9 +342,7 @@ export class JianpuBlock {
   public markBeatBounds(measuresInfo: MeasuresInfo): void {
       const timeSignature = measuresInfo.timeSignatureAtQ(this.start);
       if (!timeSignature) return;
-      const measureLength = measuresInfo.measureLengthAtQ(this.start);
-      const measureNum = measuresInfo.measureNumberAtQ(this.start);
-      const measureStart = this.start - (measureNum - Math.floor(measureNum)) * measureLength;
+      const { start: measureStart, length: measureLength } = this.measureSpan(measuresInfo);
       const timeInMeasure = this.start - measureStart;
       const beatLength = 4 / timeSignature.denominator;
 
@@ -339,9 +363,7 @@ export class JianpuBlock {
       const timeSignature = measuresInfo.timeSignatureAtQ(this.start);
       if (!timeSignature) return null; // Should not happen with proper initialization
 
-      const measureLength = measuresInfo.measureLengthAtQ(this.start);
-      const measureNum = measuresInfo.measureNumberAtQ(this.start);
-      const measureStart = this.start - (measureNum - Math.floor(measureNum)) * measureLength;
+      const { start: measureStart, length: measureLength } = this.measureSpan(measuresInfo);
       const timeInMeasure = this.start - measureStart;
 
       const beatLength = 4 / timeSignature.denominator;
