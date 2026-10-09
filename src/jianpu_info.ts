@@ -161,6 +161,14 @@ export interface JianpuInfo {
    * the pickup were the tail of a whole bar; used only with `slots`.
    */
   anacrusis?: number;
+  /**
+   * The title block printed above the first staff (SumisoraOMR fork
+   * addition): title centred, composer to the right, and a tempo mark next to
+   * the key and time signature -- each only when present. `tempo` is the
+   * declared one: `tempos` may hold a playback default that must not be
+   * printed as if the score said so.
+   */
+  header?: { title?: string; composer?: string; tempo?: number };
 }
 
 /**

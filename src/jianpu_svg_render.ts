@@ -152,6 +152,10 @@ export class JianpuSVGRender {
   private signaturesG: SVGGElement;  // Group for key/time signatures *within* the scrollable area
   private overlaySVG: SVGSVGElement; // Fixed overlay SVG for current signatures
   private overlayG: SVGGElement;     // Group within overlaySVG
+  private headerG: SVGGElement;      // Fork: title block at the top of mainSVG, above mainG
+  private headerHeight = 0;          // Fork: height the title block takes; everything else sits below it
+  private headerMinWidth = 0;        // Fork: the title block's width, so a short score still holds it
+  private leftMargin = 0;            // Fork: room before the first note for its accidental
 
   // State
   private signaturesBlinking: boolean;
@@ -277,6 +281,9 @@ export class JianpuSVGRender {
     this.smallFontSize = this.config.noteHeight * SMALL_FONT_SIZE_MULTIPLIER;
      // Estimate width for spacing (crude, might need measurement)
     this.estimatedNoteWidth = this.numberFontSize * 0.6; // Guess based on typical font aspect ratio
+    // Fork: the first note's accidental hangs to the left of its digit; with
+    // the music starting at x = 0 it was drawn outside the SVG and cut off.
+    this.leftMargin = this.estimatedNoteWidth * 0.8;
     // Position baseline: place it slightly above center for balanced look with dots/lines
     this.yBaseline = this.config.noteHeight * 1.5; // Start baseline lower to allow space above
 
@@ -322,6 +329,7 @@ export class JianpuSVGRender {
     this.mainSVG = document.createElementNS(SVGNS, 'svg');
     this.mainSVG.style.display = 'block'; // Prevent extra space below SVG
     this.parentElement.appendChild(this.mainSVG);
+    this.headerG = createSVGGroupChild(this.mainSVG, 'header'); // Fork: outside mainG's offset
     this.mainG = createSVGGroupChild(this.mainSVG, 'main-content');
 
     // Specific layers within main content
@@ -343,14 +351,15 @@ export class JianpuSVGRender {
     this.lastKnownScrollLeft = 0;
     this.isScrolling = false;
     this.height = this.config.height > 0 ? this.config.height : this.config.noteHeight * 5; // Initial guess
-    this.width = this.config.width > 0 ? this.config.width : 0;
+    this.width = this.config.width > 0 ? this.config.width : this.leftMargin;
 
     // Initial signature setup
     this.currentKey = this.jianpuModel.measuresInfo.keySignatureAtQ(0);
     this.currentKeyLabel = this.jianpuModel.measuresInfo.keySignatureLabelAtQ(0);
     this.currentTimeSignature = this.jianpuModel.measuresInfo.timeSignatureAtQ(0) ?? DEFAULT_TIME_SIGNATURE;
     this.currentTempoQpm = this.jianpuModel.measuresInfo.tempoAtQ(0);
-    this.drawSignatures(this.overlayG, 0, true, true, this.config.showTempoMarking); // Draw initial signatures in overlay
+    this.drawHeader();
+    this.drawSignatures(this.overlayG, 0, true, true, this.drawsTempo()); // Draw initial signatures in overlay
     this.updateLayout(); // Set initial sizes
   }
 
@@ -378,6 +387,56 @@ export class JianpuSVGRender {
     this.destroyed = true;
   }
 
+  /** Fork: draw the tempo mark only when asked to, or when the score declares one. */
+  private drawsTempo(): boolean {
+    return !!this.config.showTempoMarking || !!(this.jianpuInfo.header && this.jianpuInfo.header.tempo);
+  }
+
+  /**
+   * Fork: the title block, as the PDF prints it above the first system --
+   * title centred, composer right-aligned below it. Centred on the width the
+   * staff is shown in, not on the score's full (scrolling) width, so it sits
+   * over the start of the music like a page header. Sets headerHeight; the
+   * signatures and the music are laid out below it.
+   */
+  private drawHeader(): void {
+    this.headerHeight = 0;
+    this.headerMinWidth = 0;
+    const header = this.jianpuInfo.header;
+    if (!header || (!header.title && !header.composer)) return;
+    const visible = this.parentElement.clientWidth || this.div.clientWidth || 600;
+    const pad = this.config.noteHeight * 0.4;
+    const titleSize = this.numberFontSize * 0.9;
+    const composerSize = this.smallFontSize;
+    let y = pad;
+    // 放不下就别居中/靠右了：从左边距起排，SVG 撑到装得下为止（不裁掉）。
+    let needed = visible;
+    if (header.title) {
+      y += titleSize;
+      const title = drawSVGText(this.headerG, header.title, visible / 2, y, `${titleSize}px`,
+        'normal', 'middle', 'alphabetic', this.config.noteColor, 1, this.config.fontFamily);
+      title.setAttribute('data-header', 'title');
+      const w = title.getBBox().width;
+      if (w + 2 * this.leftMargin > visible) {
+        title.setAttribute('x', `${this.leftMargin + w / 2}`);
+        needed = Math.max(needed, w + 2 * this.leftMargin);
+      }
+    }
+    if (header.composer) {
+      y += composerSize * 1.6;
+      const composer = drawSVGText(this.headerG, header.composer, visible - this.leftMargin, y,
+        `${composerSize}px`, 'normal', 'end', 'alphabetic', this.config.noteColor, 1, this.config.fontFamily);
+      composer.setAttribute('data-header', 'composer');
+      const w = composer.getBBox().width;
+      if (w + 2 * this.leftMargin > visible) {
+        composer.setAttribute('x', `${this.leftMargin + w}`);
+        needed = Math.max(needed, w + 2 * this.leftMargin);
+      }
+    }
+    this.headerHeight = y + pad;
+    this.headerMinWidth = needed;
+  }
+
   /** Updates SVG and container dimensions */
    private updateLayout(contentWidth?: number) {
         this.width = contentWidth ?? this.width;
@@ -386,20 +445,25 @@ export class JianpuSVGRender {
         }
    
         // 增加基线偏移量，为签名留出更多空间
-        this.height = Math.max(this.height, this.config.noteHeight * 6); // 从5增加到6
+        this.height = Math.max(this.height, this.config.noteHeight * 6 + this.headerHeight); // 从5增加到6
         if (this.config.height > 0) {
             this.height = this.config.height;
         }
    
         // 增加yBaseline的值，使乐谱内容下移
-        const verticalPadding = this.config.noteHeight * 1.65; // 增加noteHeight的间距
-        this.mainSVG.setAttribute('width', `${this.width}`);
+        // Fork: 2.2 (was 1.65). The signature row sits above the music, and a tie
+        // over a long first note rose into it -- ties peak ~1.6 noteHeights above
+        // the digits' centre line, the signatures' lower edge reached ~0.4 below theirs.
+        const verticalPadding = this.config.noteHeight * 2.2;
+        // Fork: the SVG is at least as wide as the title block. Not this.width
+        // itself -- that is where the next incremental draw continues from.
+        this.mainSVG.setAttribute('width', `${Math.max(this.width, this.headerMinWidth)}`);
         this.mainSVG.setAttribute('height', `${this.height}`);
-        this.mainG.setAttribute('transform', `translate(0, ${this.yBaseline + verticalPadding})`); // 增加垂直间距
+        this.mainG.setAttribute('transform', `translate(0, ${this.headerHeight + this.yBaseline + verticalPadding})`); // 增加垂直间距
    
         this.overlaySVG.setAttribute('width', '200');
         this.overlaySVG.setAttribute('height', `${this.height}`);
-        this.overlayG.setAttribute('transform', `translate(0, ${this.yBaseline})`); // 签名保持原位置
+        this.overlayG.setAttribute('transform', `translate(0, ${this.headerHeight + this.yBaseline})`); // 签名保持原位置
    }
 
   /**
@@ -1421,7 +1485,7 @@ private drawRest(block: JianpuBlock, x: number, blockGroup: SVGGElement): number
 
         if (needsRedraw) {
             while (this.overlayG.lastChild) this.overlayG.removeChild(this.overlayG.lastChild);
-            this.drawSignatures(this.overlayG, 0, true, true, this.config.showTempoMarking);
+            this.drawSignatures(this.overlayG, 0, true, true, this.drawsTempo());
             // Blinking logic on scroll update
              if (scrollLeft < 10 && this.config.pixelsPerTimeStep > 0) {
                   setBlinkAnimation(this.overlayG, true); this.signaturesBlinking = true;
