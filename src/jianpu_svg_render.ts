@@ -1118,9 +1118,18 @@ private drawRest(block: JianpuBlock, x: number, blockGroup: SVGGElement): number
     let noteEndX = currentX; // Track right edge
 
     // --- Rest Symbol ('0') ---
-    const restSymbol = '0';
-    const restText = drawSVGText(blockGroup, restSymbol, currentX, 0, FONT_SIZE, 'normal', 'start', 'middle', this.config.noteColor, 1, this.config.fontFamily);
-    const restWidth = measureSVGTextWidth(restText, restSymbol, FONT_SIZE);
+    // Fork: a block that is the `-` lengthening a rest (`0 - -` in a written
+    // score) is drawn as that dash, the same dash a sustained note gets.
+    let restWidth: number;
+    if (block.augmentationDash) {
+        restWidth = this.config.noteHeight * AUGMENTATION_DASH_FACTOR;
+        const dash = drawSVGPath(blockGroup, augmentationDashPath, currentX, 0, restWidth / 50, 1);
+        setStroke(dash, this.config.noteColor, LINE_STROKE_WIDTH);
+    } else {
+        const restSymbol = '0';
+        const restText = drawSVGText(blockGroup, restSymbol, currentX, 0, FONT_SIZE, 'normal', 'start', 'middle', this.config.noteColor, 1, this.config.fontFamily);
+        restWidth = measureSVGTextWidth(restText, restSymbol, FONT_SIZE);
+    }
     noteEndX = currentX + restWidth;
 
      // --- Duration Underlines ---

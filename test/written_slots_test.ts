@@ -61,7 +61,8 @@ function blocksOf(info: JianpuInfo): JianpuBlock[] {
 }
 
 const shape = (b: JianpuBlock) =>
-  [b.start, b.notes.length ? (b.augmentationDash ? '-' : 'n') : '0', b.durationLines ?? 0, b.augmentationDots ?? 0];
+  [b.start, b.notes.length ? (b.augmentationDash ? '-' : 'n') : (b.augmentationDash ? '0-' : '0'),
+   b.durationLines ?? 0, b.augmentationDots ?? 0];
 
 test('written slots: `6 - q- q6` is four blocks, the dashes drawn as dashes', (t: test.Test) => {
   const blocks = blocksOf(score([['n', 1], ['-', 1], ['-', 0.5, 1], ['n', 0.5, 1], ['0', 1]]));
@@ -129,5 +130,38 @@ test('written slots: a block that ends a beat is marked so, for spacing', (t: te
   // mark the last sixteenth before a barline sat flush against it.
   const blocks = blocksOf(score([['n', 0.5, 1], ['n', 0.5, 1], ['n', 0.25, 2], ['n', 0.75, 1, 1]]));
   t.deepEqual(blocks.map((b) => !!b.beatEnd), [false, true, false, true]);
+  t.end();
+});
+
+test('written slots: `0 - -` is a rest and two dashes, not three rests', (t: test.Test) => {
+  const blocks = blocksOf(score([['0', 1], ['-', 1], ['-', 1], ['n', 1]]));
+  t.deepEqual(blocks.map(shape), [[0, '0', 0, 0], [1, '0-', 0, 0], [2, '0-', 0, 0], [3, 'n', 0, 0]]);
+  t.ok(blocks.slice(0, 3).every((b) => b.notes.length === 0), 'none of them is a note');
+  t.end();
+});
+
+test('written slots: two eighth rests stay two, not one quarter rest', (t: test.Test) => {
+  const blocks = blocksOf(score([['n', 1], ['0', 0.5, 1], ['0', 0.5, 1], ['n', 1]]));
+  t.deepEqual(blocks.map(shape), [[0, 'n', 0, 0], [1, '0', 1, 0], [1.5, '0', 1, 0], [2, 'n', 0, 0]]);
+  t.end();
+});
+
+test('written slots: a dotted rest keeps its dot', (t: test.Test) => {
+  const blocks = blocksOf(score([['0', 1.5, 0, 1], ['n', 0.5, 1], ['n', 1], ['n', 1]]));
+  t.deepEqual(blocks.map(shape).slice(0, 2), [[0, '0', 0, 1], [1.5, 'n', 1, 0]]);
+  t.end();
+});
+
+test('written slots: a rest lengthened by an edit is a rest plus its dashes', (t: test.Test) => {
+  const blocks = blocksOf(score([['0', 3, 0, 0, 2], ['n', 1]]));
+  t.deepEqual(blocks.map(shape), [[0, '0', 0, 0], [1, '0-', 0, 0], [2, '0-', 0, 0], [3, 'n', 0, 0]]);
+  t.end();
+});
+
+test('written slots: a `-` with nothing before it is still filled as a rest', (t: test.Test) => {
+  // A section that opens with `-` continues nothing the renderer can draw.
+  const blocks = blocksOf(score([['-', 1], ['n', 1]]));
+  t.equal(blocks[0].notes.length, 0, 'a rest');
+  t.notOk(blocks[0].augmentationDash, 'drawn as 0, not as a dash of nothing');
   t.end();
 });

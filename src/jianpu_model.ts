@@ -233,9 +233,10 @@ import {
      * A note lengthened by an edit (`dashes` > 0) is a head plus that many
      * one-beat dash blocks, as the serializer writes it.
      *
-     * Rests -- including the `-` that lengthen them -- are still filled in and
-     * split by the upstream rules; they get the same treatment as notes in a
-     * later step.
+     * Rests are blocks of their own too, and a `-` after a rest is drawn as
+     * a dash (`0 - -`, as jianpu-ly prints it, not `0 0 0`). Only time no
+     * token accounts for -- after a note that cannot be drawn, say -- is
+     * still filled with rests by the upstream rules.
      */
     private slotsToBlocks(slots: SlotInfo[], sortedLyrics: LyricInfo[]): void {
       const lyricCursor = { index: 0 };
@@ -269,9 +270,11 @@ import {
       };
 
       const blocks: JianpuBlock[] = [];
-      const addBlock = (start: number, length: number, note: JianpuNote,
+      // note 为 null 的块是休止（`0`），或延长休止的 `-`（dash 为真）。
+      const addBlock = (start: number, length: number, note: JianpuNote | null,
                         lines: number, dots: number, dash: boolean) => {
-          const block = new JianpuBlock(start, length, [note], this.measuresInfo.measureNumberAtQ(start));
+          const block = new JianpuBlock(start, length, note ? [note] : [],
+                                        this.measuresInfo.measureNumberAtQ(start));
           block.written = { lines, dots, dash };
           placeInMeasure(block);
           block.markBeatBounds(this.measuresInfo);   // spacing: a full gap after the end of a beat
@@ -282,18 +285,31 @@ import {
           jianpuNumber: of.jianpuNumber, octaveDot: of.octaveDot, accidental: 0,
       });
 
-      // 下一个 `-` 延续的那个音：遇到音符就是它，遇到休止或画不出来的音就清空——
-      // 休止后面的 `-` 属于休止，留给下面的补休止逻辑。
+      // 下一个 `-` 延续的是什么：一个音（held），一个休止（afterRest），或什么都不是
+      // （段首、画不出来的音之后）——最后这种留给下面的补休止逻辑。
       let held: JianpuNote | null = null;
+      let afterRest = false;
       for (const slot of slots) {
-          if (slot.is_rest) { held = null; continue; }
+          if (slot.is_rest) {
+              held = null;
+              afterRest = true;
+              const headLength = slot.duration - slot.dashes;
+              addBlock(slot.start, headLength, null, slot.lines, slot.dots, false);
+              for (let k = 0; k < slot.dashes; k++) {
+                  addBlock(slot.start + headLength + k, 1, null, 0, 0, true);
+              }
+              continue;
+          }
           if (slot.is_dash) {
               if (held) {
                   addBlock(slot.start, slot.duration, dashNote(held, slot.start, slot.duration),
                            slot.lines, slot.dots, true);
+              } else if (afterRest) {
+                  addBlock(slot.start, slot.duration, null, slot.lines, slot.dots, true);
               }
               continue;
           }
+          afterRest = false;
           const info = noteAt.get(slot.start.toFixed(6));
           if (!info) { held = null; continue; }
           const headLength = slot.duration - slot.dashes;
