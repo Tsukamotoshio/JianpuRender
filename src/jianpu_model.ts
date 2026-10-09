@@ -263,6 +263,12 @@ import {
           const m = measures[i];
           block.measureStartQ = m.start;
           block.measureLengthQ = m.length;
+          if (i === 0 && this.jianpuInfo.anacrusis) {
+              // 弱起：jianpu-ly 把弱起当作一整小节的末尾，拍点从「整小节应在的结尾」往回数。
+              const bar = this.measuresInfo.measureLengthAtQ(m.start);
+              block.measureStartQ = m.start + this.jianpuInfo.anacrusis - bar;
+              block.measureLengthQ = bar;
+          }
           // 整数部分是小节号（1 起），小数部分是在小节里的位置——与上游 measureNumber
           // 的含义一致，isMeasureBeginning() 和小节号绘制因此直接按文本走。
           const into = m.length > 1e-9 ? (block.start - m.start) / m.length : 0;

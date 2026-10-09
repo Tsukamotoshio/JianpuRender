@@ -1153,7 +1153,12 @@ private drawRest(block: JianpuBlock, x: number, blockGroup: SVGGElement): number
     noteEndX = currentX + restWidth;
 
      // --- Duration Underlines ---
-    if (durationLines > 0) {
+    // Fork: a rest beamed with its neighbours (see computeBeamGroups) shares
+    // the group's merged underline instead of drawing its own.
+    const beamGroup = this.beamGroupByBlock.get(block);
+    if (beamGroup) {
+        this.recordBeamAnchorAndMaybeDraw(beamGroup, block, currentX, restWidth);
+    } else if (durationLines > 0) {
         const lineYOffset = this.config.noteHeight * UNDERLINE_SPACING_FACTOR * 2.5;
         const lineSpacing = this.config.noteHeight * UNDERLINE_SPACING_FACTOR;
         const lineWidthScale = restWidth / PATH_SCALE * (DURATION_LINE_SCALES.get(durationLines) ?? 1);

@@ -113,7 +113,11 @@ export function computeBeamGroups(
   };
 
   for (const block of blocksInOrder) {
-    const isBeamable = (block.durationLines ?? 0) >= 1 && block.notes.length > 0;
+    // A rest breaks a group upstream. A block that is a written token (fork,
+    // see JianpuBlock.written) follows jianpu-ly instead: an underlined rest,
+    // or the dash lengthening one, is beamed with its neighbours like a note.
+    const isBeamable = (block.durationLines ?? 0) >= 1
+      && (block.notes.length > 0 || block.written !== undefined);
     if (!isBeamable) {
       flush();
       continue;

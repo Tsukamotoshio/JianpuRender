@@ -154,6 +154,13 @@ export interface JianpuInfo {
    * matched to its note by start. Without slots nothing changes.
    */
   slots?: SlotInfo[];
+  /**
+   * Length (quarters) of a declared pickup, e.g. 0.5 for `4/4,8`
+   * (SumisoraOMR fork addition). jianpu-ly counts the beats of the first
+   * measure back from where a full bar would end, so its beams group as if
+   * the pickup were the tail of a whole bar; used only with `slots`.
+   */
+  anacrusis?: number;
 }
 
 /**

@@ -184,3 +184,50 @@ test('held across a barline: without measures in the slots the dash stays a dash
   t.ok(blockAt(blocks, 4).augmentationDash);
   t.end();
 });
+
+// ── beams as jianpu-ly forms them (stage V1g) ───────────────────────────────
+
+/** Starts of each beam group's blocks. */
+function beamStarts(info: JianpuInfo): number[][] {
+  const model = modelOf(info);
+  return computeBeamGroups(Array.from(model.jianpuBlockMap.values()), model.measuresInfo)
+    .map((g) => g.blocks.map((b) => b.start));
+}
+
+test('beams: an underlined rest is beamed with its neighbours, as jianpu-ly does', (t: test.Test) => {
+  t.deepEqual(beamStarts(score([[['n', 0.5, 1], ['0', 0.5, 1], ['n', 1]]], 2, 4)), [[0, 0.5]], 'rest last in the beat');
+  t.deepEqual(beamStarts(score([[['0', 0.5, 1], ['n', 0.5, 1], ['n', 1]]], 2, 4)), [[0, 0.5]], 'rest first in the beat');
+  t.deepEqual(beamStarts(score([[['0', 0.25, 2], ['n', 0.25, 2], ['n', 0.25, 2], ['n', 0.25, 2], ['n', 1]]], 2, 4)),
+    [[0, 0.25, 0.5, 0.75]], 'sixteenth rest and three sixteenths');
+  t.end();
+});
+
+test('beams: the underlined dash lengthening a rest is beamed too', (t: test.Test) => {
+  t.deepEqual(beamStarts(score([[['0', 0.5, 1], ['-', 0.5, 1], ['n', 1]]], 2, 4)), [[0, 0.5]]);
+  t.end();
+});
+
+test('beams: a pickup counts its beats back from where a full bar would end', (t: test.Test) => {
+  // A 1.5-beat pickup of three eighths in 4/4: jianpu-ly treats it as the
+  // tail of a whole bar, so the beat boundary falls half a beat in and the
+  // eighths group (1)(2 3); counted from the pickup's start they would be (1 2)(3).
+  const info = score([[['n', 0.5, 1], ['n', 0.5, 1], ['n', 0.5, 1]], [['n', 1], ['n', 1], ['n', 1], ['n', 1]]]);
+  info.anacrusis = 1.5;
+  t.deepEqual(beamStarts(info), [[0.5, 1.0]]);
+  delete info.anacrusis;
+  t.deepEqual(beamStarts(info), [[0, 0.5]], 'without the declared pickup: counted from its start');
+  t.end();
+});
+
+test('beams: without slots a rest still breaks the group (upstream)', (t: test.Test) => {
+  const info: JianpuInfo = {
+    notes: [{ start: 0, length: 0.5, pitch: 60, intensity: 80 }, { start: 1, length: 0.5, pitch: 62, intensity: 80 }],
+    totalLength: 2,
+    keySignatures: [{ start: 0, key: 0 }],
+    timeSignatures: [{ start: 0, numerator: 2, denominator: 4 }],
+  };
+  const model = modelOf(info);
+  const groups = computeBeamGroups(Array.from(model.jianpuBlockMap.values()), model.measuresInfo);
+  t.ok(groups.every((g) => g.blocks.every((b) => b.notes.length > 0)), 'no rest in any group');
+  t.end();
+});
