@@ -97,6 +97,33 @@ export interface JianpuSVGRenderConfig {
   showTempoMarking?: boolean;
   /** Called when a rendered note is clicked. Receives the note data and its SVG group. */
   onNoteClick?: (note: JianpuNote, element: SVGGElement) => void;
+  /**
+   * Fork: wrap the score into lines no wider than this many pixels, breaking
+   * only at barlines, the way a printed page does. A measure wider than the
+   * line gets a line of its own and is not squeezed. Compact mode only. 0, the
+   * default, keeps the whole score on one line. Lays out what one redraw()
+   * pass draws: a later incremental pass carries on from the last line without
+   * reflowing what is already there.
+   */
+  lineWidth?: number;
+}
+
+/**
+ * Fork: one measure while wrapping. It is drawn into a group of its own, in x
+ * relative to its own start; once its width is known it is placed on a line
+ * (`line`, `offset` from the line's left edge) by moving that group.
+ */
+interface MeasureFrame {
+  g: SVGGElement;
+  line: number;
+  offset: number;
+}
+
+/** Fork: a line of the wrapped score: its group, and where its next measure goes. */
+interface LineInfo {
+  g: SVGGElement;
+  x: number;
+  count: number;
 }
 
 /** Internal structure to track visual elements tied together (e.g., across blocks). */
@@ -107,6 +134,27 @@ interface LinkedSVGDetails {
   xNoteRight: number;
   /** y position of the note number baseline (for tie vertical placement). */
   yNoteBaseline: number;
+  /** Fork: the measure the note was drawn in while wrapping (null on one line); xNoteRight is relative to it. */
+  frame: MeasureFrame | null;
+}
+
+/**
+ * Fork: a tie or hairpin reaching into another measure while wrapping. Where
+ * it ends is only known once the measure it ends in is placed on a line, so it
+ * is drawn then -- in one piece, or in two if a line break falls in between.
+ */
+interface PendingTie {
+  from: LinkedSVGDetails;
+  toG: SVGGElement;
+  toX: number;
+  to: MeasureFrame;
+}
+interface PendingHairpin {
+  direction: string;
+  xFrom: number;
+  from: MeasureFrame;
+  xTo: number;
+  to: MeasureFrame;
 }
 
 /** Map to link logical notes to their rendered SVG elements for ties. */
@@ -156,6 +204,11 @@ export class JianpuSVGRender {
   private headerHeight = 0;          // Fork: height the title block takes; everything else sits below it
   private headerMinWidth = 0;        // Fork: the title block's width, so a short score still holds it
   private leftMargin = 0;            // Fork: room before the first note for its accidental
+  // Fork: line wrapping (config.lineWidth); see MeasureFrame.
+  private lines: LineInfo[] = [];
+  private measure: MeasureFrame | null = null;   // the measure being drawn, while wrapping
+  private pendingTies: PendingTie[] = [];
+  private pendingHairpins: PendingHairpin[] = [];
 
   // State
   private signaturesBlinking: boolean;
@@ -197,6 +250,7 @@ export class JianpuSVGRender {
    */
   private openHairpin: {
     direction: string; xFrom: number; markEl: SVGTextElement | null;
+    frame: MeasureFrame | null;   // fork: the measure xFrom is relative to, while wrapping
   } | null = null;
 
   // Layout & Scaling
@@ -254,6 +308,7 @@ export class JianpuSVGRender {
       showBarNumbers: config.showBarNumbers ?? false,
       showTempoMarking: config.showTempoMarking ?? false,
       onNoteClick: config.onNoteClick, // 可选回调，无默认值
+      lineWidth: config.lineWidth ?? 0,
     };
 
      // --- Initial Model Creation ---
@@ -304,6 +359,10 @@ export class JianpuSVGRender {
       this.div.removeChild(this.div.lastChild);
     }
     this.openHairpin = null;   // fork: the element it pointed at is gone too
+    this.lines = [];
+    this.measure = null;
+    this.pendingTies = [];
+    this.pendingHairpins = [];
     this.div.style.position = 'relative'; // Needed for overlay positioning
     this.div.style.overflow = 'hidden'; // Hide internal scrollbars if parentElement scrolls
 
@@ -404,7 +463,8 @@ export class JianpuSVGRender {
     this.headerMinWidth = 0;
     const header = this.jianpuInfo.header;
     if (!header || (!header.title && !header.composer)) return;
-    const visible = this.parentElement.clientWidth || this.div.clientWidth || 600;
+    const visible = this.wraps() ? this.config.lineWidth
+      : (this.parentElement.clientWidth || this.div.clientWidth || 600);
     const pad = this.config.noteHeight * 0.4;
     const titleSize = this.numberFontSize * 0.9;
     const composerSize = this.smallFontSize;
@@ -437,6 +497,158 @@ export class JianpuSVGRender {
     this.headerMinWidth = needed;
   }
 
+  /** Fork: where the first line of music sits, below the title block and the signatures. */
+  private musicTop(): number {
+    // 增加yBaseline的值，使乐谱内容下移
+    // Fork: 2.2 (was 1.65). The signature row sits above the music, and a tie
+    // over a long first note rose into it -- ties peak ~1.6 noteHeights above
+    // the digits' centre line, the signatures' lower edge reached ~0.4 below theirs.
+    const verticalPadding = this.config.noteHeight * 2.2;
+    return this.headerHeight + this.yBaseline + verticalPadding;
+  }
+
+  /** Fork: whether this pass wraps the score into lines (see config.lineWidth). */
+  private wraps(): boolean {
+    return this.config.lineWidth > 0 && this.config.pixelsPerTimeStep <= 0;
+  }
+
+  /** Fork: where drawing goes -- the measure being drawn while wrapping, else the one line. */
+  private target(): SVGGElement {
+    return this.measure ? this.measure.g : this.musicG;
+  }
+
+  /** Fork: a barline centred on x, drawn into `container`. */
+  private drawBarLine(container: SVGGElement, x: number): void {
+    // Adjust bar height based on estimated content height or fixed value
+    const barHeight = this.config.noteHeight * 2; // Example height
+    const bar = drawSVGPath(container, barPath, x, 0, 1, barHeight / PATH_SCALE); // Scale bar path (height 100)
+    setStroke(bar, this.config.noteColor, LINE_STROKE_WIDTH);
+  }
+
+  /** Fork: a tie arc in `g` from x0 to x1 (g's coordinates), shaped as the inline ties are. */
+  private drawTieArc(g: SVGGElement, x0: number, x1: number): void {
+    const width = x1 - x0;
+    if (width > 1) {
+      drawSVGPath(g, tiePath, x0, -this.config.noteHeight * 1.2,
+                  width / PATH_SCALE * 1.3, (this.config.noteHeight / PATH_SCALE) * 1.6);
+    }
+  }
+
+  /** Fork: a new, empty line of the wrapped score. */
+  private newLine(): LineInfo {
+    const g = createSVGGroupChild(this.musicG);
+    g.setAttribute('data-line', `${this.lines.length}`);
+    const line = { g, x: this.leftMargin, count: 0 };
+    this.lines.push(line);
+    return line;
+  }
+
+  /** Fork: starts the group that the measure beginning with `block` is drawn into. */
+  private startMeasure(block: JianpuBlock): void {
+    const line = this.lines.length ? this.lines[this.lines.length - 1] : this.newLine();
+    const g = createSVGGroupChild(line.g);
+    g.setAttribute('data-measure', `${Math.floor(block.measureNumber)}`);
+    this.measure = { g, line: this.lines.length - 1, offset: 0 };
+  }
+
+  /**
+   * Fork: puts the measure just drawn (`width` wide, its closing barline and
+   * the space after it included) at the end of the current line, or starts a
+   * new line with it if it would run past config.lineWidth -- a measure is
+   * never split. Then draws the ties and hairpins that were waiting for it.
+   */
+  private placeMeasure(width: number): void {
+    const m = this.measure!;
+    let line = this.lines[this.lines.length - 1];
+    if (line.count > 0 && line.x + width > this.config.lineWidth) {
+      line = this.newLine();
+      line.g.appendChild(m.g);
+    }
+    m.line = this.lines.length - 1;
+    m.offset = line.x;
+    m.g.setAttribute('transform', `translate(${m.offset}, 0)`);
+    line.x += width;
+    line.count++;
+    this.settle(m);
+  }
+
+  /**
+   * Fork: draws the ties and hairpins that end in measure `m`, now that it has
+   * its place. Where a line break falls in between, each is drawn in pieces,
+   * as LilyPond draws it: a tie as one arc running out to the end of the line
+   * and one coming in from the start of the next; a hairpin as a piece on each
+   * line, opening steadily from one piece to the next.
+   */
+  private settle(m: MeasureFrame): void {
+    const lineEnd = (k: number) => this.lines[k].x - this.estimatedNoteWidth * 0.6;   // its last barline
+    const lineStart = this.leftMargin * 0.25;
+    // tiePath runs from x = -13 to 90 and is scaled by 1.3 * width / 100, so an
+    // arc reaches 0.169 of its width before x0 and 1.17 of it after.
+    const before = 13 * 1.3 / 100;
+    const after = 90 * 1.3 / 100;
+    this.pendingTies = this.pendingTies.filter((t) => {
+      if (t.to !== m) return true;
+      const a = t.from.frame!;
+      if (a.line === m.line) {
+        this.drawTieArc(t.from.g, t.from.xNoteRight, t.toX + m.offset - a.offset);
+      } else {
+        const x0 = t.from.xNoteRight;
+        this.drawTieArc(t.from.g, x0, x0 + (lineEnd(a.line) - 1 - a.offset - x0) / after);
+        const x1 = t.toX;
+        this.drawTieArc(t.toG, (lineStart - m.offset + before * x1) / (1 + before), x1);
+      }
+      return false;
+    });
+    this.pendingHairpins = this.pendingHairpins.filter((h) => {
+      if (h.to !== m) return true;
+      // In line coordinates: a line's group is only ever moved vertically.
+      const gap = this.config.noteHeight * HAIRPIN_GAP_FACTOR;
+      const pieces: Array<[number, number, number]> = [];   // line, from x, to x
+      if (h.from.line === m.line) {
+        pieces.push([m.line, h.xFrom + h.from.offset, h.xTo + m.offset]);
+      } else {
+        pieces.push([h.from.line, h.xFrom + h.from.offset, lineEnd(h.from.line) - gap]);
+        for (let k = h.from.line + 1; k < m.line; k++) pieces.push([k, lineStart, lineEnd(k) - gap]);
+        pieces.push([m.line, lineStart, h.xTo + m.offset]);
+      }
+      const total = pieces.reduce((sum, p) => sum + Math.max(0, p[2] - p[1]), 0);
+      let done = 0;
+      for (const [k, x0, x1] of pieces) {
+        const t0 = total > 0 ? done / total : 0;
+        done += Math.max(0, x1 - x0);
+        const t1 = total > 0 ? done / total : 1;
+        const openings: [number, number] = h.direction === '>' ? [1 - t0, 1 - t1] : [t0, t1];
+        this.drawHairpin({ direction: h.direction, xFrom: x0 }, x1, this.lines[k].g,
+                         pieces.length > 1 ? openings : undefined);
+      }
+      return false;
+    });
+  }
+
+  /**
+   * Fork: stacks the lines of the wrapped score. Each sits a fixed distance
+   * below the one before, or further if what hangs below that line and what
+   * rises above this one (lyrics, octave dots, ties) need the room.
+   */
+  private stackLines(): void {
+    const pitch = this.config.noteHeight * 4;
+    const gap = this.config.noteHeight * 0.6;
+    // Measure every line before moving any: each move would force a new layout.
+    const boxes = this.lines.map((line) => {
+      try {
+        const box = line.g.getBBox();
+        return { top: box.y, bottom: box.y + box.height };
+      } catch (e) {
+        return { top: 0, bottom: 0 };   // not rendered
+      }
+    });
+    let y = 0;
+    this.lines.forEach((line, k) => {
+      if (k > 0) y += Math.max(pitch, boxes[k - 1].bottom - boxes[k].top + gap);
+      line.g.setAttribute('transform', `translate(0, ${y})`);
+    });
+  }
+
   /** Updates SVG and container dimensions */
    private updateLayout(contentWidth?: number) {
         this.width = contentWidth ?? this.width;
@@ -450,16 +662,11 @@ export class JianpuSVGRender {
             this.height = this.config.height;
         }
    
-        // 增加yBaseline的值，使乐谱内容下移
-        // Fork: 2.2 (was 1.65). The signature row sits above the music, and a tie
-        // over a long first note rose into it -- ties peak ~1.6 noteHeights above
-        // the digits' centre line, the signatures' lower edge reached ~0.4 below theirs.
-        const verticalPadding = this.config.noteHeight * 2.2;
         // Fork: the SVG is at least as wide as the title block. Not this.width
         // itself -- that is where the next incremental draw continues from.
         this.mainSVG.setAttribute('width', `${Math.max(this.width, this.headerMinWidth)}`);
         this.mainSVG.setAttribute('height', `${this.height}`);
-        this.mainG.setAttribute('transform', `translate(0, ${this.headerHeight + this.yBaseline + verticalPadding})`); // 增加垂直间距
+        this.mainG.setAttribute('transform', `translate(0, ${this.musicTop()})`); // 增加垂直间距
    
         this.overlaySVG.setAttribute('width', '200');
         this.overlaySVG.setAttribute('height', `${this.height}`);
@@ -580,11 +787,22 @@ export class JianpuSVGRender {
         let minHeight = 0; // Max extent above baseline (negative y)
 
         const linkedNoteMap: LinkedNoteMap = new Map(); // For ties across blocks
+        const wrap = this.wraps();
 
         this.jianpuModel.jianpuBlockMap.forEach((block, startTimeQ) => {
             // Check if block start time is >= last rendered quarter note time
             // Use a small tolerance for floating point comparisons
             if (startTimeQ >= this.lastRenderedQ - 1e-9) { // Draw new or overlapping blocks
+                 // Fork: wrapping. A measure starts a group of its own, x from 0; the one
+                 // just finished gets its closing barline and goes onto a line.
+                 if (wrap && (!this.measure || (block.isMeasureBeginning() && block.start > 1e-6))) {
+                     if (this.measure) {
+                         this.drawBarLine(this.measure.g, contentWidth - this.estimatedNoteWidth * 0.6);
+                         this.placeMeasure(contentWidth);
+                     }
+                     this.startMeasure(block);
+                     contentWidth = 0;
+                 }
                  if (isCompact) {
                      // In compact mode, currentX advances with each drawn element
                      currentX = contentWidth; // Position determined by previous element's width
@@ -607,9 +825,21 @@ export class JianpuSVGRender {
             }
         });
 
+        if (this.measure) {   // fork: the last measure, while wrapping
+            this.placeMeasure(contentWidth);
+            this.measure = null;
+        }
+
         // Fork: settle a hairpin left open by the last note before measuring,
         // since dropping its mark changes the bounds the height comes from.
         this.finishOpenHairpin();
+
+        if (wrap) {
+            this.stackLines();
+            // As wide as the lines are meant to be; wider only for a measure that
+            // could not fit on a line of its own.
+            contentWidth = this.lines.reduce((w, line) => Math.max(w, line.x), this.config.lineWidth);
+        }
 
         // Track vertical bounds once for the whole music group, rather than
         // once per block inside the loop above. getBBox() forces a synchronous
@@ -620,11 +850,13 @@ export class JianpuSVGRender {
         // musicG rather than into a block group (bar lines, merged beam bars),
         // so the resulting bounds can only ever be equal or slightly taller,
         // never tighter: no risk of clipping content that used to fit.
+        let musicBottom = this.config.noteHeight * 1.5;   // fork: lowest point drawn, for wrapping
         try {
             const musicBox = this.musicG.getBBox();
             if (musicBox.height > 0) {
                 minHeight = Math.min(minHeight, musicBox.y);
                 maxHeight = Math.max(maxHeight, musicBox.y + musicBox.height);
+                musicBottom = musicBox.y + musicBox.height;
             }
         } catch (e) {
             // Ignore getBBox error if the group is not rendered (display:none)
@@ -632,7 +864,12 @@ export class JianpuSVGRender {
         }
 
         // Update overall layout based on new content bounds
-        this.height = Math.max(this.height, (maxHeight - minHeight) + this.config.noteHeight); // Add buffer
+        if (wrap) {
+            // Fork: down to the bottom of the last line, from where the first one sits.
+            this.height = Math.max(this.height, this.musicTop() + musicBottom + this.config.noteHeight * 0.5);
+        } else {
+            this.height = Math.max(this.height, (maxHeight - minHeight) + this.config.noteHeight); // Add buffer
+        }
         this.updateLayout(contentWidth);
     }
 
@@ -673,18 +910,17 @@ export class JianpuSVGRender {
        let blockWidth = 0;
        const isCompact = this.config.pixelsPerTimeStep <= 0;
        const isMeasureStart = block.isMeasureBeginning();
-       const blockGroup = createSVGGroupChild(this.musicG, `block-${block.start}`);
+       const blockGroup = createSVGGroupChild(this.target(), `block-${block.start}`);
        blockGroup.setAttribute('data-block-start', `${block.start}`); // For later lookup
 
        // --- 1. Draw Bar Line (if needed) ---
        // Bar lines are drawn *before* the block they precede.
        if (isMeasureStart && block.start > 1e-6) { // Don't draw bar at time 0
-           const barX = x - (isCompact ? this.estimatedNoteWidth * 0.6 : 4); // Position slightly before block
-           // Adjust bar height based on estimated content height or fixed value
-           const barHeight = this.config.noteHeight * 2; // Example height
-           const barY = 0; // Center bar vertically around baseline
-           const bar = drawSVGPath(this.musicG, barPath, barX, barY, 1, barHeight / PATH_SCALE); // Scale bar path (height 100)
-           setStroke(bar, this.config.noteColor, LINE_STROKE_WIDTH);
+           // Fork: while wrapping, the redraw loop has drawn it already, closing the
+           // measure before -- a line break leaves it at the end of that line.
+           if (!this.measure) {
+               this.drawBarLine(this.musicG, x - (isCompact ? this.estimatedNoteWidth * 0.6 : 4)); // Position slightly before block
+           }
            if (isCompact) {
                 blockWidth += LINE_STROKE_WIDTH; // Add bar width if compact
            }
@@ -701,7 +937,7 @@ export class JianpuSVGRender {
            const barX = x - (isCompact ? this.estimatedNoteWidth * 0.6 : 4); // Same x as the bar line
            const barNumberY = -this.config.noteHeight * 2.2; // Above the octave dots (highest ~ -1.9 * noteHeight)
            drawSVGText(
-               this.musicG,
+               this.target(),
                String(Math.round(block.measureNumber)), // Integer part is the measure number
                isTimeZero ? x : barX,
                barNumberY,
@@ -727,7 +963,8 @@ export class JianpuSVGRender {
        if ((keyChanged || timeChanged || tempoChanged) && block.start > 1e-6) {
             // Draw the new signature(s) in the signaturesG (scrollable part)
             const sigX = x + blockWidth; // Position it after potential bar line
-            signatureWidth = this.drawSignatures(this.signaturesG, sigX, keyChanged, timeChanged, tempoChanged);
+            signatureWidth = this.drawSignatures(this.measure ? this.measure.g : this.signaturesG,
+                                                 sigX, keyChanged, timeChanged, tempoChanged);
             if (isCompact) {
                  blockWidth += signatureWidth + this.estimatedNoteWidth * 0.2; // Add width and spacing
             }
@@ -780,11 +1017,7 @@ export class JianpuSVGRender {
         // --- 更新结束小节线判断
         const isFinalBlock = this.jianpuModel.isLastMeasureAtQ(block.start + block.length);
         if (isFinalBlock) {
-            const barX = x + blockWidth;
-            const barHeight = this.config.noteHeight * 2;
-            const barY = 0;
-            const bar = drawSVGPath(this.musicG, barPath, barX, barY, 1, barHeight / PATH_SCALE);
-            setStroke(bar, this.config.noteColor, LINE_STROKE_WIDTH);
+            this.drawBarLine(this.target(), x + blockWidth);
             if (isCompact) {
                 blockWidth += LINE_STROKE_WIDTH;
             }
@@ -961,8 +1194,14 @@ private drawNotes(
         // no wedge at all. Closing first and opening second is what gives a
         // note that both ends one hairpin and starts another the right shape.
         if (this.openHairpin && (note.hairpinEnd || note.dynamic)) {
-            this.drawHairpin(this.openHairpin,
-                noteStartX - this.config.noteHeight * HAIRPIN_GAP_FACTOR);
+            const xTo = noteStartX - this.config.noteHeight * HAIRPIN_GAP_FACTOR;
+            const open = this.openHairpin;
+            if (this.measure && open.frame && open.frame !== this.measure) {
+                this.pendingHairpins.push({ direction: open.direction, xFrom: open.xFrom,
+                                            from: open.frame, xTo, to: this.measure });
+            } else {
+                this.drawHairpin(open, xTo);
+            }
             this.openHairpin = null;
         }
         if (note.hairpinStart) {
@@ -970,6 +1209,7 @@ private drawNotes(
                 direction: note.hairpinStart,
                 xFrom: noteEndX + this.config.noteHeight * HAIRPIN_GAP_FACTOR,
                 markEl,
+                frame: this.measure,
             };
         }
 
@@ -999,7 +1239,8 @@ private drawNotes(
         const noteLogicalEndPositionX = noteEndX;
         if (note.tiedTo && !augmentationDash) {
             // 存储当前note信息，等待后续绘制
-            linkedNoteMap.set(note, { g: noteG, xNoteRight: noteLogicalEndPositionX, yNoteBaseline: 0 });
+            linkedNoteMap.set(note, { g: noteG, xNoteRight: noteLogicalEndPositionX, yNoteBaseline: 0,
+                                      frame: this.measure });
         } else if (note.tiedFrom) {
             // 递归查找链接的第一个note
             let firstNote = note.tiedFrom;
@@ -1023,7 +1264,10 @@ private drawNotes(
                 const tieScaleX = tieWidth / PATH_SCALE * 1.3;
                 const tieScaleY = (this.config.noteHeight / PATH_SCALE) * 1.6;
 
-                if (tieWidth > 1) {
+                if (prevLink.frame !== this.measure) {
+                    // Fork: from another measure while wrapping -- drawn once this one is placed.
+                    this.pendingTies.push({ from: prevLink, toG: noteG, toX: tieEndX, to: this.measure! });
+                } else if (tieWidth > 1) {
                     // 从第一个note到当前note绘制tie
                     drawSVGPath(prevLink.g, tiePath,
                                 tieStartX - (prevLink.g.getCTM()?.e ?? 0),
@@ -1051,7 +1295,11 @@ private drawNotes(
             if (prevLink) {
                 const tieStartX = prevLink.xNoteRight;
                 const tieWidth = (noteStartX - noteSpacing) - tieStartX;
-                if (tieWidth > 1) {
+                if (prevLink.frame !== this.measure) {
+                    // Fork: from another measure while wrapping -- drawn once this one is placed.
+                    this.pendingTies.push({ from: prevLink, toG: noteG, toX: noteStartX - noteSpacing,
+                                            to: this.measure! });
+                } else if (tieWidth > 1) {
                     drawSVGPath(prevLink.g, tiePath,
                                 tieStartX - (prevLink.g.getCTM()?.e ?? 0),
                                 -this.config.noteHeight * 1.2,
@@ -1062,7 +1310,7 @@ private drawNotes(
             }
         }
         if (note.writtenTieTo) {
-            linkedNoteMap.set(note, { g: noteG, xNoteRight: noteEndX, yNoteBaseline: 0 });
+            linkedNoteMap.set(note, { g: noteG, xNoteRight: noteEndX, yNoteBaseline: 0, frame: this.measure });
         }
 
          maxX = Math.max(maxX, noteEndX); // Update the overall rightmost edge relative to block start 'x'
@@ -1078,10 +1326,15 @@ private drawNotes(
  * music (fork addition).
  * @param open The hairpin being closed: its direction and its left edge.
  * @param xTo Right edge of the wedge, just before the note that closes it.
+ * @param container Where to draw it (fork; x is in its coordinates).
+ * @param openings Fork: for one piece of a hairpin a line break cuts in two,
+ *     how far open it is at its left and right ends, 0 (the point) to 1.
  */
 private drawHairpin(
     open: { direction: string; xFrom: number },
-    xTo: number
+    xTo: number,
+    container: SVGGElement = this.target(),
+    openings?: [number, number]
 ): void {
     const width = xTo - open.xFrom;
     if (width <= 1) {
@@ -1090,8 +1343,12 @@ private drawHairpin(
     const height = this.config.noteHeight * HAIRPIN_HEIGHT_FACTOR;
     const yMid = this.config.noteHeight
         * (DYNAMIC_Y_FACTOR + DYNAMIC_FONT_SIZE_MULTIPLIER / 2);
-    const path = open.direction === '>' ? decrescendoPath : crescendoPath;
-    const wedge = drawSVGPath(this.musicG, path, open.xFrom, yMid,
+    let path = open.direction === '>' ? decrescendoPath : crescendoPath;
+    if (openings) {
+        const [a, b] = openings;
+        path = `M 100,${-50 * b} L 0,${-50 * a} M 0,${50 * a} L 100,${50 * b}`;
+    }
+    const wedge = drawSVGPath(container, path, open.xFrom, yMid,
         width / PATH_SCALE, height / PATH_SCALE);
     setStroke(wedge, this.config.noteColor, LINE_STROKE_WIDTH);
     wedge.setAttributeNS(null, 'fill', 'none');   // two lines, not a triangle
@@ -1158,7 +1415,7 @@ private drawBeamGroup(group: BeamGroup, anchors: Array<{ x: number; width: numbe
     const drawSegment = (level: number, xStart: number, xEnd: number) => {
         const yPosition = lineYOffset + (level - 1) * lineSpacing;
         const widthScale = (xEnd - xStart) / PATH_SCALE;
-        const line = drawSVGPath(this.musicG, underlinePath, xStart, yPosition, widthScale, 1);
+        const line = drawSVGPath(this.target(), underlinePath, xStart, yPosition, widthScale, 1);
         setStroke(line, this.config.noteColor, LINE_STROKE_WIDTH);
     };
 
