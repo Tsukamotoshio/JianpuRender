@@ -98,11 +98,15 @@ export interface JianpuSVGRenderConfig {
   /** Called when a rendered note is clicked. Receives the note data and its SVG group. */
   onNoteClick?: (note: JianpuNote, element: SVGGElement) => void;
   /**
-   * Fork: wrap the score into lines no wider than this many pixels, breaking
-   * only at barlines, the way a printed page does. A measure wider than the
-   * line gets a line of its own and is not squeezed. Compact mode only. 0, the
-   * default, keeps the whole score on one line. Lays out what one redraw()
-   * pass draws: a later incremental pass carries on from the last line without
+   * Fork: lay the score out as LilyPond prints it: notes spaced by duration
+   * with LilyPond's own rules, wrapped into lines no wider than this many
+   * pixels (breaking only at barlines), every line -- the last one too --
+   * justified so that its last barline sits at the right edge; a score that
+   * fits on one line keeps its natural spacing, as LilyPond's does. A measure
+   * wider than the line gets a line of its own and is neither squeezed nor
+   * stretched. Compact mode only. 0, the default, keeps the whole score on one
+   * line with the original compact spacing. Lays out what one redraw() pass
+   * draws: a later incremental pass carries on from the last line without
    * reflowing what is already there.
    */
   lineWidth?: number;
@@ -111,19 +115,41 @@ export interface JianpuSVGRenderConfig {
 /**
  * Fork: one measure while wrapping. It is drawn into a group of its own, in x
  * relative to its own start; once its width is known it is placed on a line
- * (`line`, `offset` from the line's left edge) by moving that group.
+ * (`line`, `offset` from the line's left edge) by moving that group. What it
+ * holds is recorded so that justifying its line can move it: its blocks and
+ * barlines by where they start (`x`, measure-relative, before justifying),
+ * and the beams, which are only drawn then.
  */
 interface MeasureFrame {
   g: SVGGElement;
   line: number;
   offset: number;
+  width: number;
+  /**
+   * Each block, where it starts, and its spring (see spacing()): the room it
+   * would like, the least it can have, and how readily it stretches.
+   */
+  blocks: Array<{ g: SVGGElement; x: number; ideal: number; min: number; k: number }>;
+  /** How far justifying its line has moved this measure's start. */
+  shiftStart: number;
+  bars: Array<{ el: SVGPathElement; x: number }>;
+  beams: Array<{ group: BeamGroup; anchors: Array<{ x: number; width: number; at: number }> }>;
+  /** x of its closing barline (the score's final barline for the last measure). */
+  closingBarX?: number;
 }
 
-/** Fork: a line of the wrapped score: its group, and where its next measure goes. */
+/**
+ * Fork: a line of the wrapped score: its group, where its next measure goes,
+ * and once it is justified, how far a point of one of its measures has moved
+ * (`shift`, given the measure and where the point starts in it) and where its
+ * last barline now is (`end`).
+ */
 interface LineInfo {
   g: SVGGElement;
   x: number;
-  count: number;
+  measures: MeasureFrame[];
+  shift?: (m: MeasureFrame, x: number) => number;
+  end?: number;
 }
 
 /** Internal structure to track visual elements tied together (e.g., across blocks). */
@@ -136,24 +162,30 @@ interface LinkedSVGDetails {
   yNoteBaseline: number;
   /** Fork: the measure the note was drawn in while wrapping (null on one line); xNoteRight is relative to it. */
   frame: MeasureFrame | null;
+  /** Fork: where the note's block starts in that measure -- the point it moves with when its line is justified. */
+  at: number;
 }
 
 /**
- * Fork: a tie or hairpin reaching into another measure while wrapping. Where
- * it ends is only known once the measure it ends in is placed on a line, so it
- * is drawn then -- in one piece, or in two if a line break falls in between.
+ * Fork: a tie or hairpin, while wrapping. Its two ends move by different
+ * amounts when a line is justified, so it is drawn only once the line it ends
+ * on is -- in one piece, or in two if a line break falls in between. `at`
+ * fields are the block starts each end moves with (see LinkedSVGDetails.at).
  */
 interface PendingTie {
   from: LinkedSVGDetails;
   toG: SVGGElement;
   toX: number;
+  toAt: number;
   to: MeasureFrame;
 }
 interface PendingHairpin {
   direction: string;
   xFrom: number;
+  fromAt: number;
   from: MeasureFrame;
   xTo: number;
+  toAt: number;
   to: MeasureFrame;
 }
 
@@ -207,6 +239,10 @@ export class JianpuSVGRender {
   // Fork: line wrapping (config.lineWidth); see MeasureFrame.
   private lines: LineInfo[] = [];
   private measure: MeasureFrame | null = null;   // the measure being drawn, while wrapping
+  private blockAt = 0;                           // where the block being drawn starts in it
+  private staffSpace = 0;                        // LilyPond's unit, in px, while wrapping (see spacing())
+  private shortestQ = 0.75;                      // the piece's common shortest duration, in quarters
+  private nextOverhang = 0;                      // how far the next note's accidental reaches left of it
   private pendingTies: PendingTie[] = [];
   private pendingHairpins: PendingHairpin[] = [];
 
@@ -240,7 +276,7 @@ export class JianpuSVGRender {
   // integration re-renders from a fresh instance on every edit rather than
   // appending to an existing one, so that path stays unexercised.
   private beamGroupByBlock: Map<JianpuBlock, BeamGroup>;
-  private beamGroupAnchors: Map<BeamGroup, Array<{ x: number; width: number }>>;
+  private beamGroupAnchors: Map<BeamGroup, Array<{ x: number; width: number; at: number }>>;
   /**
    * The hairpin waiting for the note that closes it, during one drawing pass
    * (fork addition). A hairpin spans notes, so it can only be drawn once the
@@ -251,6 +287,7 @@ export class JianpuSVGRender {
   private openHairpin: {
     direction: string; xFrom: number; markEl: SVGTextElement | null;
     frame: MeasureFrame | null;   // fork: the measure xFrom is relative to, while wrapping
+    at: number;                   // fork: and where its note's block starts in it
   } | null = null;
 
   // Layout & Scaling
@@ -517,19 +554,143 @@ export class JianpuSVGRender {
     return this.measure ? this.measure.g : this.musicG;
   }
 
-  /** Fork: a barline centred on x, drawn into `container`. */
-  private drawBarLine(container: SVGGElement, x: number): void {
-    // Adjust bar height based on estimated content height or fixed value
-    const barHeight = this.config.noteHeight * 2; // Example height
-    const bar = drawSVGPath(container, barPath, x, 0, 1, barHeight / PATH_SCALE); // Scale bar path (height 100)
-    setStroke(bar, this.config.noteColor, LINE_STROKE_WIDTH);
+  /**
+   * Fork: LilyPond's common shortest duration (`calc-common-shortest-duration`
+   * in lily/spacing-spanner.cc): the shortest note starting in each measure,
+   * taken over the measures, the most frequent one -- the shorter on a tie --
+   * and never longer than `base-shortest-duration`, 3/16 of a whole note.
+   * In quarter notes.
+   */
+  private commonShortest(): number {
+    const counts = new Map<number, number>();
+    let shortest = Infinity;
+    const flush = () => {
+      if (shortest !== Infinity) {
+        const d = Math.round(shortest * 1e6) / 1e6;
+        counts.set(d, (counts.get(d) ?? 0) + 1);
+      }
+      shortest = Infinity;
+    };
+    this.jianpuModel.jianpuBlockMap.forEach((block) => {
+      if (block.isMeasureBeginning() && block.start > 1e-6) flush();
+      if (block.length > 1e-9) shortest = Math.min(shortest, block.length);
+    });
+    flush();
+    let best = Infinity;
+    let bestCount = 0;
+    counts.forEach((count, d) => {
+      if (count > bestCount || (count === bestCount && d < best)) {
+        best = d;
+        bestCount = count;
+      }
+    });
+    return Math.min(0.75, best);
   }
 
-  /** Fork: a tie arc in `g` from x0 to x1 (g's coordinates), shaped as the inline ties are. */
-  private drawTieArc(g: SVGGElement, x0: number, x1: number): void {
-    const width = x1 - x0;
+  /**
+   * Fork: LilyPond's spacing for one note (or rest, or dash -- jianpu-ly
+   * prints each as a note or rest of its own), in px. `ideal` is the room
+   * from its start to the next one's: `get_duration_space` in
+   * lily/spacing-options.cc, (shortest-duration-space 2.0 + log2(duration /
+   * common shortest)) * spacing-increment 1.2 staff spaces, linear below the
+   * shortest -- less the 1.2 of a canonical notehead and plus the head's own
+   * width (lily/note-spacing.cc; see headWidth()). `k` is how readily that
+   * room stretches when a line is justified: lily/spacing-basic.cc gives a
+   * spring max(0.1, space - 1.2).
+   */
+  private spacing(block: JianpuBlock): { ideal: number; k: number } {
+    const ratio = block.length / this.shortestQ;
+    const space = (ratio < 1 ? 2.0 + ratio - 1 : 2.0 + Math.log2(ratio)) * 1.2;
+    return {
+      ideal: (space - 1.2 + this.headWidth(block)) * this.staffSpace,
+      k: Math.max(0.1, space - 1.2) * this.staffSpace,
+    };
+  }
+
+  /**
+   * Fork: how wide LilyPond takes a block's head to be, in staff spaces.
+   * jianpu-ly draws every head as text, but LilyPond still measures a rest by
+   * its own glyph (`ly:rest::width`). A digit, or a dash after a note, is
+   * 0.556 em of NimbusSans-Bold at 11 pt = 1.223. A rest, or a dash after
+   * one, is Emmentaler's neomensural rest (jianpu-ly's `Rest.style`): 0.8 up
+   * to a quarter, 0.4 from a half up -- and since there is no neomensural
+   * 32nd or 64th rest, those fall back to the default glyphs (lily/rest.cc),
+   * 1.52 and 1.668. Except that jianpu-ly writes an underlined rest no beam
+   * reaches from the left as a note (its `use_rest_hack`), spaced as one.
+   */
+  private headWidth(block: JianpuBlock): number {
+    if (block.notes.length > 0) return 1.223;
+    const group = this.beamGroupByBlock.get(block);
+    if ((block.durationLines ?? 0) >= 1 && (!group || group.blocks[0] === block)) return 1.223;
+    const dots = block.augmentationDots ?? 0;
+    const base = block.length / (dots === 1 ? 1.5 : dots === 2 ? 1.75 : 1);
+    if (base >= 2 - 1e-6) return 0.4;
+    if (base >= 0.25 - 1e-6) return 0.8;
+    return base >= 0.125 - 1e-6 ? 1.52 : 1.668;
+  }
+
+  /**
+   * Fork: how far a block's accidental reaches left of its digit, in px, as
+   * LilyPond places it: Emmentaler's sharp or flat at jianpu-ly's
+   * `Accidental.font-size -4` (0.693 / 0.572 staff spaces) and
+   * AccidentalPlacement `right-padding` 0.15 between it and the head.
+   */
+  private overhang(block: JianpuBlock | undefined): number {
+    if (!block) return 0;
+    let ss = 0;
+    for (const note of block.notes) {
+      if (note.accidental === 1) ss = Math.max(ss, 0.693 + 0.15);
+      else if (note.accidental === 2) ss = Math.max(ss, 0.572 + 0.15);
+    }
+    return ss * this.staffSpace;
+  }
+
+  /**
+   * Fork: how much wider than its digit a lone note's underline is drawn. On
+   * one line, upstream's 1.15-1.78. Laid out as LilyPond does, the digit's own
+   * width: there the underline is a beamlet about a head long
+   * (`beamlet-default-length` 1.1 staff spaces), and the wider one reached
+   * into the next note and past the barline once the spacing tightened.
+   */
+  private loneUnderlineScale(lines: number): number {
+    return this.measure ? 1 : (DURATION_LINE_SCALES.get(lines) ?? 1);
+  }
+
+  /** Fork: a barline centred on x, drawn into `container`. */
+  private drawBarLine(container: SVGGElement, x: number): SVGPathElement {
+    const bar = drawSVGPath(container, barPath, x, 0, 1, this.barScaleY()); // Scale bar path (height 100)
+    setStroke(bar, this.config.noteColor, LINE_STROKE_WIDTH);
+    return bar;
+  }
+
+  /** Fork: the vertical scale of a barline's path. */
+  private barScaleY(): number {
+    // Adjust bar height based on estimated content height or fixed value
+    const barHeight = this.config.noteHeight * 2; // Example height
+    return barHeight / PATH_SCALE;
+  }
+
+  /** Fork: while wrapping, records a barline drawn at measure x, so justifying its line can move it. */
+  private recordBar(bar: SVGPathElement, x: number, closing: boolean): void {
+    if (!this.measure) return;
+    this.measure.bars.push({ el: bar, x });
+    if (closing) this.measure.closingBarX = x;
+  }
+
+  /**
+   * Fork: a tie arc in `g` reaching from `left` to `right` (g's coordinates)
+   * and no further. The inline ties are placed by a start point the arc then
+   * overhangs on both sides -- tiePath runs from x = -13 to 90 and is scaled
+   * by 1.3 * width / 100, so 0.169 of the width before it and 1.17 after --
+   * which on a stretched line carried a long tie from a line's first note out
+   * past the left edge. LilyPond's tie runs from one note to the next.
+   */
+  private drawTieSpan(g: SVGGElement, left: number, right: number): void {
+    const before = 13 * 1.3 / 100;
+    const after = 90 * 1.3 / 100;
+    const width = (right - left) / (before + after);
     if (width > 1) {
-      drawSVGPath(g, tiePath, x0, -this.config.noteHeight * 1.2,
+      drawSVGPath(g, tiePath, left + before * width, -this.config.noteHeight * 1.2,
                   width / PATH_SCALE * 1.3, (this.config.noteHeight / PATH_SCALE) * 1.6);
     }
   }
@@ -538,7 +699,7 @@ export class JianpuSVGRender {
   private newLine(): LineInfo {
     const g = createSVGGroupChild(this.musicG);
     g.setAttribute('data-line', `${this.lines.length}`);
-    const line = { g, x: this.leftMargin, count: 0 };
+    const line: LineInfo = { g, x: this.leftMargin, measures: [] };
     this.lines.push(line);
     return line;
   }
@@ -548,77 +709,153 @@ export class JianpuSVGRender {
     const line = this.lines.length ? this.lines[this.lines.length - 1] : this.newLine();
     const g = createSVGGroupChild(line.g);
     g.setAttribute('data-measure', `${Math.floor(block.measureNumber)}`);
-    this.measure = { g, line: this.lines.length - 1, offset: 0 };
+    // line -1 until placed: justifying the line before must not take it (or what ends in it) for its own.
+    this.measure = { g, line: -1, offset: 0, width: 0, blocks: [], shiftStart: 0, bars: [], beams: [] };
   }
 
   /**
    * Fork: puts the measure just drawn (`width` wide, its closing barline and
-   * the space after it included) at the end of the current line, or starts a
-   * new line with it if it would run past config.lineWidth -- a measure is
-   * never split. Then draws the ties and hairpins that were waiting for it.
+   * the space after it included) at the end of the current line, or -- if it
+   * would run past config.lineWidth -- justifies that line and starts a new
+   * one with it. A measure is never split.
    */
   private placeMeasure(width: number): void {
     const m = this.measure!;
     let line = this.lines[this.lines.length - 1];
-    if (line.count > 0 && line.x + width > this.config.lineWidth) {
+    // It fits if its closing barline does; the space after that only matters mid-line.
+    const end = m.closingBarX !== undefined ? m.closingBarX + LINE_STROKE_WIDTH / 2 : width;
+    if (line.measures.length > 0 && line.x + end > this.config.lineWidth) {
+      this.justifyLine(this.lines.length - 1);
       line = this.newLine();
       line.g.appendChild(m.g);
     }
     m.line = this.lines.length - 1;
     m.offset = line.x;
+    m.width = width;
     m.g.setAttribute('transform', `translate(${m.offset}, 0)`);
     line.x += width;
-    line.count++;
-    this.settle(m);
+    line.measures.push(m);
   }
 
   /**
-   * Fork: draws the ties and hairpins that end in measure `m`, now that it has
-   * its place. Where a line break falls in between, each is drawn in pieces,
-   * as LilyPond draws it: a tie as one arc running out to the end of the line
-   * and one coming in from the start of the next; a hairpin as a piece on each
-   * line, opening steadily from one piece to the next.
+   * Fork: justifies line `k` once all its measures are placed: stretches it so
+   * that its last barline lands at the right edge (lineWidth, less the
+   * barline's own width), the way LilyPond's springs do (lily/spring.cc,
+   * lily/simple-spacer.cc): one force for the whole line, each spring then as
+   * long as max(its minimum, ideal + force * k) -- a note's from spacing(),
+   * and the room after each barline but the last its own k, half of
+   * BarLine's `next-note` semi-fixed-space 0.9 (the other half is fixed;
+   * lily/staff-spacing.cc). A note held at its minimum by the next note's
+   * accidental only starts to grow once the force has caught up with it.
+   * Glyphs keep their size; each block, and each barline, moves by what the
+   * springs before where it starts have grown. Then draws what spans between
+   * blocks with the new positions: beams, and the ties and hairpins that end
+   * on this line.
    */
-  private settle(m: MeasureFrame): void {
-    const lineEnd = (k: number) => this.lines[k].x - this.estimatedNoteWidth * 0.6;   // its last barline
+  private justifyLine(k: number): void {
+    const line = this.lines[k];
+    const last = line.measures[line.measures.length - 1];
+    const natural = last.offset + (last.closingBarX ?? last.width);
+    const target = this.config.lineWidth - LINE_STROKE_WIDTH;
+    const barSpring = this.staffSpace * 0.45;
+    const bars = line.measures.length - 1;
+    const grown = (b: { ideal: number; min: number; k: number }, f: number) =>
+      Math.max(b.min, b.ideal + f * b.k) - Math.max(b.min, b.ideal);
+    const stretchBy = (f: number) => line.measures.reduce(
+      (sum, m) => m.blocks.reduce((s2, b) => s2 + grown(b, f), sum), f * barSpring * bars);
+    // The force that takes the line to the target, found by halving: what the
+    // springs grow by rises with it, though not linearly once a spring that
+    // was held at its minimum starts to grow. A line already too long -- one
+    // measure wider than the line -- is left as it is.
+    // As LilyPond does (lily/constrained-breaking.cc, space_line): a score that
+    // fits on a single line is not stretched to the line's width -- it keeps its
+    // natural spacing. (A line that is the whole score is the last one too.)
+    const onlyLine = k === 0 && this.measure === null && this.lines.length === 1;
+    let force = 0;
+    const need = target - natural;
+    if (need > 0 && !onlyLine && stretchBy(1e6) > need) {
+      let lo = 0;
+      let hi = 1;
+      while (stretchBy(hi) < need) hi *= 2;
+      for (let i = 0; i < 50; i++) {
+        const mid = (lo + hi) / 2;
+        if (stretchBy(mid) < need) lo = mid; else hi = mid;
+      }
+      force = (lo + hi) / 2;
+    }
+    let before = 0;
+    line.measures.forEach((m, i) => {
+      m.shiftStart = before;
+      before += m.blocks.reduce((sum, b) => sum + grown(b, force), 0);
+      if (i < bars) before += force * barSpring;
+    });
+    const shift = (m: MeasureFrame, x: number) =>
+      m.blocks.reduce((sum, b) => (b.x < x - 1e-6 ? sum + grown(b, force) : sum), m.shiftStart);
+    line.shift = shift;
+    line.end = natural + stretchBy(force);
+    for (const m of line.measures) {
+      const at = (x: number) => shift(m, x);
+      for (const b of m.blocks) b.g.setAttribute('transform', `translate(${at(b.x)}, 0)`);
+      for (const bar of m.bars) {
+        bar.el.setAttribute('transform', `translate(${bar.x + at(bar.x)}, 0) scale(1, ${this.barScaleY()})`);
+      }
+      for (const beam of m.beams) {
+        this.drawBeamGroup(beam.group, beam.anchors.map((a) => ({ x: a.x + at(a.at), width: a.width })), m.g);
+      }
+    }
+    this.settle(k);
+  }
+
+  /**
+   * Fork: draws the ties and hairpins that end on line `k`, now that it is
+   * justified (and so is every line before it). Where a line break falls in
+   * between, each is drawn in pieces, as LilyPond draws it: a tie as one arc
+   * running out to the end of the line and one coming in from the start of
+   * the next; a hairpin as a piece on each line, opening steadily from one
+   * piece to the next.
+   */
+  private settle(k: number): void {
     const lineStart = this.leftMargin * 0.25;
-    // tiePath runs from x = -13 to 90 and is scaled by 1.3 * width / 100, so an
-    // arc reaches 0.169 of its width before x0 and 1.17 of it after.
-    const before = 13 * 1.3 / 100;
-    const after = 90 * 1.3 / 100;
+    // Where measure-relative x, moving with the block that starts at `at`, now is on its line.
+    const onLine = (m: MeasureFrame, x: number, at: number) => m.offset + x + this.lines[m.line].shift!(m, at);
     this.pendingTies = this.pendingTies.filter((t) => {
-      if (t.to !== m) return true;
+      if (t.to.line !== k) return true;
       const a = t.from.frame!;
-      if (a.line === m.line) {
-        this.drawTieArc(t.from.g, t.from.xNoteRight, t.toX + m.offset - a.offset);
+      // Each arc goes into its note's group, which has moved with its block: the
+      // group's own x = 0 is now at line x `origin`.
+      const fromOrigin = onLine(a, 0, t.from.at);
+      const toOrigin = onLine(t.to, 0, t.toAt);
+      if (a.line === k) {
+        this.drawTieSpan(t.from.g, t.from.xNoteRight, toOrigin + t.toX - fromOrigin);
       } else {
-        const x0 = t.from.xNoteRight;
-        this.drawTieArc(t.from.g, x0, x0 + (lineEnd(a.line) - 1 - a.offset - x0) / after);
-        const x1 = t.toX;
-        this.drawTieArc(t.toG, (lineStart - m.offset + before * x1) / (1 + before), x1);
+        this.drawTieSpan(t.from.g, t.from.xNoteRight, this.lines[a.line].end! - 1 - fromOrigin);
+        this.drawTieSpan(t.toG, lineStart - toOrigin, t.toX);
       }
       return false;
     });
     this.pendingHairpins = this.pendingHairpins.filter((h) => {
-      if (h.to !== m) return true;
+      if (h.to.line !== k) return true;
       // In line coordinates: a line's group is only ever moved vertically.
       const gap = this.config.noteHeight * HAIRPIN_GAP_FACTOR;
+      const lineEnd = (j: number) => this.lines[j].end! - gap;
+      const xFrom = onLine(h.from, h.xFrom, h.fromAt);
+      const xTo = onLine(h.to, h.xTo, h.toAt);
       const pieces: Array<[number, number, number]> = [];   // line, from x, to x
-      if (h.from.line === m.line) {
-        pieces.push([m.line, h.xFrom + h.from.offset, h.xTo + m.offset]);
+      if (h.from.line === k) {
+        pieces.push([k, xFrom, xTo]);
       } else {
-        pieces.push([h.from.line, h.xFrom + h.from.offset, lineEnd(h.from.line) - gap]);
-        for (let k = h.from.line + 1; k < m.line; k++) pieces.push([k, lineStart, lineEnd(k) - gap]);
-        pieces.push([m.line, lineStart, h.xTo + m.offset]);
+        pieces.push([h.from.line, xFrom, lineEnd(h.from.line)]);
+        for (let j = h.from.line + 1; j < k; j++) pieces.push([j, lineStart, lineEnd(j)]);
+        pieces.push([k, lineStart, xTo]);
       }
       const total = pieces.reduce((sum, p) => sum + Math.max(0, p[2] - p[1]), 0);
       let done = 0;
-      for (const [k, x0, x1] of pieces) {
+      for (const [j, x0, x1] of pieces) {
         const t0 = total > 0 ? done / total : 0;
         done += Math.max(0, x1 - x0);
         const t1 = total > 0 ? done / total : 1;
         const openings: [number, number] = h.direction === '>' ? [1 - t0, 1 - t1] : [t0, t1];
-        this.drawHairpin({ direction: h.direction, xFrom: x0 }, x1, this.lines[k].g,
+        this.drawHairpin({ direction: h.direction, xFrom: x0 }, x1, this.lines[j].g,
                          pieces.length > 1 ? openings : undefined);
       }
       return false;
@@ -788,8 +1025,16 @@ export class JianpuSVGRender {
 
         const linkedNoteMap: LinkedNoteMap = new Map(); // For ties across blocks
         const wrap = this.wraps();
+        if (wrap) {
+            // Fork: LilyPond's unit. Its jianpu digits are 11 pt text on a 20 pt staff,
+            // whose staff space is 5 pt; ours are numberFontSize px.
+            this.staffSpace = this.numberFontSize * 5 / 11;
+            this.shortestQ = this.commonShortest();
+        }
 
+        let blockIndex = 0;
         this.jianpuModel.jianpuBlockMap.forEach((block, startTimeQ) => {
+            const nextBlock = allBlocksInOrder[++blockIndex];
             // Check if block start time is >= last rendered quarter note time
             // Use a small tolerance for floating point comparisons
             if (startTimeQ >= this.lastRenderedQ - 1e-9) { // Draw new or overlapping blocks
@@ -797,11 +1042,23 @@ export class JianpuSVGRender {
                  // just finished gets its closing barline and goes onto a line.
                  if (wrap && (!this.measure || (block.isMeasureBeginning() && block.start > 1e-6))) {
                      if (this.measure) {
-                         this.drawBarLine(this.measure.g, contentWidth - this.estimatedNoteWidth * 0.6);
-                         this.placeMeasure(contentWidth);
+                         // LilyPond measures the last note's space up to the barline
+                         // (lily/note-spacing.cc, space-to-barline); after it, BarLine's
+                         // next-note semi-fixed-space 0.9 to the next note.
+                         // The fixed half of that grows until a first note's accidental clears the
+                         // barline by 0.3 staff spaces (lily/staff-spacing.cc, min_dist_correction).
+                         const barX = contentWidth + LINE_STROKE_WIDTH / 2;
+                         this.recordBar(this.drawBarLine(this.measure.g, barX), barX, true);
+                         const clear = Math.max(0, this.overhang(block) - this.staffSpace * 0.15);
+                         this.placeMeasure(contentWidth + LINE_STROKE_WIDTH + this.staffSpace * 0.9 + clear);
                      }
                      this.startMeasure(block);
                      contentWidth = 0;
+                 }
+                 if (wrap) {
+                     // the next note's accidental, unless a barline comes first
+                     this.nextOverhang = nextBlock && !(nextBlock.isMeasureBeginning() && nextBlock.start > 1e-6)
+                         ? this.overhang(nextBlock) : 0;
                  }
                  if (isCompact) {
                      // In compact mode, currentX advances with each drawn element
@@ -825,9 +1082,10 @@ export class JianpuSVGRender {
             }
         });
 
-        if (this.measure) {   // fork: the last measure, while wrapping
+        if (this.measure) {   // fork: the last measure, and its line, while wrapping
             this.placeMeasure(contentWidth);
             this.measure = null;
+            this.justifyLine(this.lines.length - 1);
         }
 
         // Fork: settle a hairpin left open by the last note before measuring,
@@ -837,8 +1095,10 @@ export class JianpuSVGRender {
         if (wrap) {
             this.stackLines();
             // As wide as the lines are meant to be; wider only for a measure that
-            // could not fit on a line of its own.
-            contentWidth = this.lines.reduce((w, line) => Math.max(w, line.x), this.config.lineWidth);
+            // could not fit on a line of its own. A line ends at its last barline --
+            // the room after it belongs to the next measure, which is on the next line.
+            contentWidth = this.lines.reduce(
+                (w, line) => Math.max(w, (line.end ?? line.x) + LINE_STROKE_WIDTH), this.config.lineWidth);
         }
 
         // Track vertical bounds once for the whole music group, rather than
@@ -912,6 +1172,10 @@ export class JianpuSVGRender {
        const isMeasureStart = block.isMeasureBeginning();
        const blockGroup = createSVGGroupChild(this.target(), `block-${block.start}`);
        blockGroup.setAttribute('data-block-start', `${block.start}`); // For later lookup
+       if (this.measure) {   // fork: justifying the line moves the block by where it starts
+           this.measure.blocks.push({ g: blockGroup, x, ideal: 0, min: 0, k: 0 });
+           this.blockAt = x;
+       }
 
        // --- 1. Draw Bar Line (if needed) ---
        // Bar lines are drawn *before* the block they precede.
@@ -921,7 +1185,7 @@ export class JianpuSVGRender {
            if (!this.measure) {
                this.drawBarLine(this.musicG, x - (isCompact ? this.estimatedNoteWidth * 0.6 : 4)); // Position slightly before block
            }
-           if (isCompact) {
+           if (isCompact && !this.measure) {
                 blockWidth += LINE_STROKE_WIDTH; // Add bar width if compact
            }
        }
@@ -937,7 +1201,7 @@ export class JianpuSVGRender {
            const barX = x - (isCompact ? this.estimatedNoteWidth * 0.6 : 4); // Same x as the bar line
            const barNumberY = -this.config.noteHeight * 2.2; // Above the octave dots (highest ~ -1.9 * noteHeight)
            drawSVGText(
-               this.target(),
+               this.measure ? blockGroup : this.musicG,   // fork: moves with its block while wrapping
                String(Math.round(block.measureNumber)), // Integer part is the measure number
                isTimeZero ? x : barX,
                barNumberY,
@@ -963,7 +1227,7 @@ export class JianpuSVGRender {
        if ((keyChanged || timeChanged || tempoChanged) && block.start > 1e-6) {
             // Draw the new signature(s) in the signaturesG (scrollable part)
             const sigX = x + blockWidth; // Position it after potential bar line
-            signatureWidth = this.drawSignatures(this.measure ? this.measure.g : this.signaturesG,
+            signatureWidth = this.drawSignatures(this.measure ? blockGroup : this.signaturesG,
                                                  sigX, keyChanged, timeChanged, tempoChanged);
             if (isCompact) {
                  blockWidth += signatureWidth + this.estimatedNoteWidth * 0.2; // Add width and spacing
@@ -983,7 +1247,16 @@ export class JianpuSVGRender {
 
 
        // --- 4. Calculate Total Width ---
-        if (isCompact) {
+        if (this.measure) {
+            // Fork: wrapping -- LilyPond's spacing (see spacing()): the note's ideal room,
+            // or what it holds (a lyric, a dynamic, an in-line signature) if that is wider.
+            // The least it can have (lily/separation-item.cc): what it holds, padding 0.1,
+            // and the next note's accidental.
+            const { ideal, k } = this.spacing(block);
+            const min = blockWidth + contentWidth + this.staffSpace * 0.1 + this.nextOverhang;
+            blockWidth = Math.max(ideal, min);
+            Object.assign(this.measure.blocks[this.measure.blocks.length - 1], { ideal, min, k });
+        } else if (isCompact) {
             // Total width is accumulated width of bar, signature, and content
             blockWidth += contentWidth;
             
@@ -1017,7 +1290,8 @@ export class JianpuSVGRender {
         // --- 更新结束小节线判断
         const isFinalBlock = this.jianpuModel.isLastMeasureAtQ(block.start + block.length);
         if (isFinalBlock) {
-            this.drawBarLine(this.target(), x + blockWidth);
+            const barX = x + blockWidth + (this.measure ? LINE_STROKE_WIDTH / 2 : 0);
+            this.recordBar(this.drawBarLine(this.target(), barX), barX, true);
             if (isCompact) {
                 blockWidth += LINE_STROKE_WIDTH;
             }
@@ -1134,7 +1408,7 @@ private drawNotes(
         } else if (durationLines > 0) {
             const lineYOffset = this.config.noteHeight * UNDERLINE_SPACING_FACTOR * 2.5;
             const lineSpacing = this.config.noteHeight * UNDERLINE_SPACING_FACTOR;
-            const lineWidthScale = noteWidth / PATH_SCALE * (DURATION_LINE_SCALES.get(durationLines) ?? 1);
+            const lineWidthScale = noteWidth / PATH_SCALE * this.loneUnderlineScale(durationLines);
 
             for (let lineIndex = 0; lineIndex < durationLines; lineIndex++) {
                 const yPosition = lineYOffset + lineIndex * lineSpacing;
@@ -1196,9 +1470,9 @@ private drawNotes(
         if (this.openHairpin && (note.hairpinEnd || note.dynamic)) {
             const xTo = noteStartX - this.config.noteHeight * HAIRPIN_GAP_FACTOR;
             const open = this.openHairpin;
-            if (this.measure && open.frame && open.frame !== this.measure) {
-                this.pendingHairpins.push({ direction: open.direction, xFrom: open.xFrom,
-                                            from: open.frame, xTo, to: this.measure });
+            if (this.measure && open.frame) {   // fork: wrapping -- drawn once its line is justified
+                this.pendingHairpins.push({ direction: open.direction, xFrom: open.xFrom, fromAt: open.at,
+                                            from: open.frame, xTo, toAt: this.blockAt, to: this.measure });
             } else {
                 this.drawHairpin(open, xTo);
             }
@@ -1210,6 +1484,7 @@ private drawNotes(
                 xFrom: noteEndX + this.config.noteHeight * HAIRPIN_GAP_FACTOR,
                 markEl,
                 frame: this.measure,
+                at: this.blockAt,
             };
         }
 
@@ -1240,7 +1515,7 @@ private drawNotes(
         if (note.tiedTo && !augmentationDash) {
             // 存储当前note信息，等待后续绘制
             linkedNoteMap.set(note, { g: noteG, xNoteRight: noteLogicalEndPositionX, yNoteBaseline: 0,
-                                      frame: this.measure });
+                                      frame: this.measure, at: this.blockAt });
         } else if (note.tiedFrom) {
             // 递归查找链接的第一个note
             let firstNote = note.tiedFrom;
@@ -1264,9 +1539,10 @@ private drawNotes(
                 const tieScaleX = tieWidth / PATH_SCALE * 1.3;
                 const tieScaleY = (this.config.noteHeight / PATH_SCALE) * 1.6;
 
-                if (prevLink.frame !== this.measure) {
-                    // Fork: from another measure while wrapping -- drawn once this one is placed.
-                    this.pendingTies.push({ from: prevLink, toG: noteG, toX: tieEndX, to: this.measure! });
+                if (this.measure) {
+                    // Fork: wrapping -- drawn once the line it ends on is justified.
+                    this.pendingTies.push({ from: prevLink, toG: noteG, toX: tieEndX, toAt: this.blockAt,
+                                            to: this.measure });
                 } else if (tieWidth > 1) {
                     // 从第一个note到当前note绘制tie
                     drawSVGPath(prevLink.g, tiePath,
@@ -1295,10 +1571,10 @@ private drawNotes(
             if (prevLink) {
                 const tieStartX = prevLink.xNoteRight;
                 const tieWidth = (noteStartX - noteSpacing) - tieStartX;
-                if (prevLink.frame !== this.measure) {
-                    // Fork: from another measure while wrapping -- drawn once this one is placed.
+                if (this.measure) {
+                    // Fork: wrapping -- drawn once the line it ends on is justified.
                     this.pendingTies.push({ from: prevLink, toG: noteG, toX: noteStartX - noteSpacing,
-                                            to: this.measure! });
+                                            toAt: this.blockAt, to: this.measure });
                 } else if (tieWidth > 1) {
                     drawSVGPath(prevLink.g, tiePath,
                                 tieStartX - (prevLink.g.getCTM()?.e ?? 0),
@@ -1310,7 +1586,8 @@ private drawNotes(
             }
         }
         if (note.writtenTieTo) {
-            linkedNoteMap.set(note, { g: noteG, xNoteRight: noteEndX, yNoteBaseline: 0, frame: this.measure });
+            linkedNoteMap.set(note, { g: noteG, xNoteRight: noteEndX, yNoteBaseline: 0,
+                                      frame: this.measure, at: this.blockAt });
         }
 
          maxX = Math.max(maxX, noteEndX); // Update the overall rightmost edge relative to block start 'x'
@@ -1382,10 +1659,15 @@ private recordBeamAnchorAndMaybeDraw(
     group: BeamGroup, block: JianpuBlock, noteStartX: number, noteWidth: number
 ): void {
     const anchors = this.beamGroupAnchors.get(group) ?? [];
-    anchors.push({ x: noteStartX, width: noteWidth });
+    anchors.push({ x: noteStartX, width: noteWidth, at: this.blockAt });
     this.beamGroupAnchors.set(group, anchors);
     if (anchors.length === group.blocks.length) {
-        this.drawBeamGroup(group, anchors);
+        if (this.measure) {
+            // Fork: wrapping -- drawn once the line is justified (a beam never crosses a barline).
+            this.measure.beams.push({ group, anchors });
+        } else {
+            this.drawBeamGroup(group, anchors);
+        }
         this.beamGroupAnchors.delete(group);
     }
 }
@@ -1407,7 +1689,9 @@ private recordBeamAnchorAndMaybeDraw(
  * produces a hook, so treat this specific branch as unverified until it's
  * checked against a real mixed-duration file.
  */
-private drawBeamGroup(group: BeamGroup, anchors: Array<{ x: number; width: number }>): void {
+private drawBeamGroup(
+    group: BeamGroup, anchors: Array<{ x: number; width: number }>, container: SVGGElement = this.target()
+): void {
     const lineYOffset = this.config.noteHeight * UNDERLINE_SPACING_FACTOR * 2.5;
     const lineSpacing = this.config.noteHeight * UNDERLINE_SPACING_FACTOR;
     const hookLength = this.estimatedNoteWidth * 0.6;
@@ -1415,7 +1699,7 @@ private drawBeamGroup(group: BeamGroup, anchors: Array<{ x: number; width: numbe
     const drawSegment = (level: number, xStart: number, xEnd: number) => {
         const yPosition = lineYOffset + (level - 1) * lineSpacing;
         const widthScale = (xEnd - xStart) / PATH_SCALE;
-        const line = drawSVGPath(this.target(), underlinePath, xStart, yPosition, widthScale, 1);
+        const line = drawSVGPath(container, underlinePath, xStart, yPosition, widthScale, 1);
         setStroke(line, this.config.noteColor, LINE_STROKE_WIDTH);
     };
 
@@ -1482,7 +1766,7 @@ private drawRest(block: JianpuBlock, x: number, blockGroup: SVGGElement): number
     } else if (durationLines > 0) {
         const lineYOffset = this.config.noteHeight * UNDERLINE_SPACING_FACTOR * 2.5;
         const lineSpacing = this.config.noteHeight * UNDERLINE_SPACING_FACTOR;
-        const lineWidthScale = restWidth / PATH_SCALE * (DURATION_LINE_SCALES.get(durationLines) ?? 1);
+        const lineWidthScale = restWidth / PATH_SCALE * this.loneUnderlineScale(durationLines);
         
         for (let lineIndex = 0; lineIndex < durationLines; lineIndex++) {
             const yPosition = lineYOffset + lineIndex * lineSpacing;
