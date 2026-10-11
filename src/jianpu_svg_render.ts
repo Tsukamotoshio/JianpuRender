@@ -494,44 +494,55 @@ export class JianpuSVGRender {
    * staff is shown in, not on the score's full (scrolling) width, so it sits
    * over the start of the music like a page header. Sets headerHeight; the
    * signatures and the music are laid out below it.
+   *
+   * Sized and spaced as SumisoraOMR's pipeline asks LilyPond to print it
+   * (core/render/renderer.py, build_lilypond_title_markup): the title at
+   * `\fontsize #3` and the composer at `\fontsize #1` over the 11 pt text the
+   * digits are set in -- each step is 2^(1/6) -- one above the other at
+   * LilyPond's text `baseline-skip` of 3 staff spaces. Both in the regular
+   * upright face although the markup asks for `\bold` and `\italic`: it also
+   * names a font (`font-name`), and in LilyPond that overrides weight and
+   * shape, so the PDF shows them plain. Without a title the pipeline prints
+   * no title block at all, so a composer alone is not drawn either.
+   *
+   * One knowing departure: a title (or composer) wider than the line is made
+   * smaller until it fits. LilyPond neither wraps nor shrinks it -- a long
+   * one runs past the page's margins and off its edge -- which is a fault of
+   * the PDF, not a look to copy; here it would also make the score scroll
+   * sideways.
    */
   private drawHeader(): void {
     this.headerHeight = 0;
     this.headerMinWidth = 0;
     const header = this.jianpuInfo.header;
-    if (!header || (!header.title && !header.composer)) return;
+    if (!header || !header.title) return;
     const visible = this.wraps() ? this.config.lineWidth
       : (this.parentElement.clientWidth || this.div.clientWidth || 600);
     const pad = this.config.noteHeight * 0.4;
-    const titleSize = this.numberFontSize * 0.9;
-    const composerSize = this.smallFontSize;
+    const titleSize = this.numberFontSize * Math.pow(2, 3 / 6);
+    const composerSize = this.numberFontSize * Math.pow(2, 1 / 6);
+    const staffSpace = this.numberFontSize * 5 / 11;   // LilyPond's: 11 pt text on a 20 pt staff
     let y = pad;
-    // 放不下就别居中/靠右了：从左边距起排，SVG 撑到装得下为止（不裁掉）。
-    let needed = visible;
-    if (header.title) {
-      y += titleSize;
-      const title = drawSVGText(this.headerG, header.title, visible / 2, y, `${titleSize}px`,
-        'normal', 'middle', 'alphabetic', this.config.noteColor, 1, this.config.fontFamily);
-      title.setAttribute('data-header', 'title');
-      const w = title.getBBox().width;
-      if (w + 2 * this.leftMargin > visible) {
-        title.setAttribute('x', `${this.leftMargin + w / 2}`);
-        needed = Math.max(needed, w + 2 * this.leftMargin);
-      }
-    }
+    const room = visible - 2 * this.leftMargin;
+    // Too wide for the line: smaller until it fits, on the same baseline.
+    const fit = (el: SVGTextElement, size: number) => {
+      const w = el.getBBox().width;
+      if (w > room && room > 0) el.setAttribute('font-size', `${size * room / w}px`);
+    };
+    y += titleSize;
+    const title = drawSVGText(this.headerG, header.title, visible / 2, y, `${titleSize}px`,
+      'normal', 'middle', 'alphabetic', this.config.noteColor, 1, this.config.fontFamily);
+    title.setAttribute('data-header', 'title');
+    fit(title, titleSize);
     if (header.composer) {
-      y += composerSize * 1.6;
+      y += 3 * staffSpace;   // baseline to baseline
       const composer = drawSVGText(this.headerG, header.composer, visible - this.leftMargin, y,
         `${composerSize}px`, 'normal', 'end', 'alphabetic', this.config.noteColor, 1, this.config.fontFamily);
       composer.setAttribute('data-header', 'composer');
-      const w = composer.getBBox().width;
-      if (w + 2 * this.leftMargin > visible) {
-        composer.setAttribute('x', `${this.leftMargin + w}`);
-        needed = Math.max(needed, w + 2 * this.leftMargin);
-      }
+      fit(composer, composerSize);
     }
     this.headerHeight = y + pad;
-    this.headerMinWidth = needed;
+    this.headerMinWidth = visible;
   }
 
   /** Fork: where the first line of music sits, below the title block and the signatures. */
