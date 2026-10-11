@@ -811,8 +811,8 @@ export class JianpuSVGRender {
    * justified (and so is every line before it). Where a line break falls in
    * between, each is drawn in pieces, as LilyPond draws it: a tie as one arc
    * running out to the end of the line and one coming in from the start of
-   * the next; a hairpin as a piece on each line, opening steadily from one
-   * piece to the next.
+   * the next; a hairpin as a piece on each line, its ends as open as
+   * LilyPond's are (see below).
    */
   private settle(k: number): void {
     const lineStart = this.leftMargin * 0.25;
@@ -848,16 +848,18 @@ export class JianpuSVGRender {
         for (let j = h.from.line + 1; j < k; j++) pieces.push([j, lineStart, lineEnd(j)]);
         pieces.push([k, lineStart, xTo]);
       }
-      const total = pieces.reduce((sum, p) => sum + Math.max(0, p[2] - p[1]), 0);
-      let done = 0;
-      for (const [j, x0, x1] of pieces) {
-        const t0 = total > 0 ? done / total : 0;
-        done += Math.max(0, x1 - x0);
-        const t1 = total > 0 ? done / total : 1;
-        const openings: [number, number] = h.direction === '>' ? [1 - t0, 1 - t1] : [t0, t1];
+      // How far each piece is open at its ends is fixed, not shared out by length
+      // (lily/hairpin.cc): a crescendo carried on to the next line ends 2/3 open and
+      // the piece that picks it up starts 1/3 open; a decrescendo the other way round.
+      pieces.forEach(([j, x0, x1], n) => {
+        const first = n === 0;
+        const last = n === pieces.length - 1;
+        const openings: [number, number] = h.direction === '>'
+          ? [first ? 1 : 2 / 3, last ? 0 : 1 / 3]
+          : [first ? 0 : 1 / 3, last ? 1 : 2 / 3];
         this.drawHairpin({ direction: h.direction, xFrom: x0 }, x1, this.lines[j].g,
                          pieces.length > 1 ? openings : undefined);
-      }
+      });
       return false;
     });
   }
