@@ -35,6 +35,8 @@ import  {
   crescendoPath, decrescendoPath
 } from './svg_paths';
 
+import { printedBarNumber } from './bar_numbers';
+
 import {
   JianpuInfo, TimeSignatureInfo, NoteInfo,
    DEFAULT_TIME_SIGNATURE
@@ -122,6 +124,8 @@ export interface JianpuSVGRenderConfig {
  */
 interface MeasureFrame {
   g: SVGGElement;
+  /** Its measure, counted from 1 as `JianpuBlock.measureNumber` counts. */
+  number: number;
   line: number;
   offset: number;
   width: number;
@@ -132,7 +136,8 @@ interface MeasureFrame {
   blocks: Array<{ g: SVGGElement; x: number; ideal: number; min: number; k: number }>;
   /** How far justifying its line has moved this measure's start. */
   shiftStart: number;
-  bars: Array<{ el: SVGPathElement; x: number }>;
+  /** `at`: where the springs that move it end, when not at `x` (the final barline's thin line). */
+  bars: Array<{ el: SVGPathElement; x: number; at?: number }>;
   beams: Array<{ group: BeamGroup; anchors: Array<{ x: number; width: number; at: number }> }>;
   /** x of its closing barline (the score's final barline for the last measure). */
   closingBarX?: number;
@@ -236,6 +241,7 @@ export class JianpuSVGRender {
   private headerHeight = 0;          // Fork: height the title block takes; everything else sits below it
   private headerMinWidth = 0;        // Fork: the title block's width, so a short score still holds it
   private leftMargin = 0;            // Fork: room before the first note for its accidental
+  private lineStartX = 0;            // Fork: where a wrapped line's music starts (room for its bar number)
   // Fork: line wrapping (config.lineWidth); see MeasureFrame.
   private lines: LineInfo[] = [];
   private measure: MeasureFrame | null = null;   // the measure being drawn, while wrapping
@@ -674,6 +680,30 @@ export class JianpuSVGRender {
     return bar;
   }
 
+  /**
+   * Fork: the score's final barline (jianpu-ly ends every part with `\bar "|."`),
+   * its thick line's right edge where an ordinary barline centred on x would
+   * end. As LilyPond draws it: the thick line about 3.2 times the thin one,
+   * and 1.6 thin lines apart (PDF: 0.95 and 2.99 pt, centres 3.46 pt apart).
+   * Ours keep the width the ordinary barline has, 1 px at any size, so the
+   * ratios are kept rather than LilyPond's staff-space sizes.
+   */
+  private drawFinalBarLine(container: SVGGElement, x: number): void {
+    const thick = LINE_STROKE_WIDTH * 3.16;
+    const thickX = x + LINE_STROKE_WIDTH / 2 - thick / 2;
+    const thinX = thickX - thick / 2 - LINE_STROKE_WIDTH * 1.6 - LINE_STROKE_WIDTH / 2;
+    const thin = this.drawBarLine(container, thinX);
+    thin.setAttribute('data-bar', 'final-thin');
+    const bar = this.drawBarLine(container, thickX);
+    setStroke(bar, this.config.noteColor, thick);
+    bar.setAttribute('data-bar', 'final');
+    if (this.measure) {
+      this.measure.bars.push({ el: thin, x: thinX, at: x });
+      this.measure.bars.push({ el: bar, x: thickX, at: x });
+      this.measure.closingBarX = x;
+    }
+  }
+
   /** Fork: the vertical scale of a barline's path. */
   private barScaleY(): number {
     // Adjust bar height based on estimated content height or fixed value
@@ -696,21 +726,22 @@ export class JianpuSVGRender {
    * which on a stretched line carried a long tie from a line's first note out
    * past the left edge. LilyPond's tie runs from one note to the next.
    */
-  private drawTieSpan(g: SVGGElement, left: number, right: number): void {
+  private drawTieSpan(g: SVGGElement, left: number, right: number): SVGPathElement | null {
     const before = 13 * 1.3 / 100;
     const after = 90 * 1.3 / 100;
     const width = (right - left) / (before + after);
     if (width > 1) {
-      drawSVGPath(g, tiePath, left + before * width, -this.config.noteHeight * 1.2,
-                  width / PATH_SCALE * 1.3, (this.config.noteHeight / PATH_SCALE) * 1.6);
+      return drawSVGPath(g, tiePath, left + before * width, -this.config.noteHeight * 1.2,
+                         width / PATH_SCALE * 1.3, (this.config.noteHeight / PATH_SCALE) * 1.6);
     }
+    return null;
   }
 
   /** Fork: a new, empty line of the wrapped score. */
   private newLine(): LineInfo {
     const g = createSVGGroupChild(this.musicG);
     g.setAttribute('data-line', `${this.lines.length}`);
-    const line: LineInfo = { g, x: this.leftMargin, measures: [] };
+    const line: LineInfo = { g, x: this.lineStartX, measures: [] };
     this.lines.push(line);
     return line;
   }
@@ -721,7 +752,8 @@ export class JianpuSVGRender {
     const g = createSVGGroupChild(line.g);
     g.setAttribute('data-measure', `${Math.floor(block.measureNumber)}`);
     // line -1 until placed: justifying the line before must not take it (or what ends in it) for its own.
-    this.measure = { g, line: -1, offset: 0, width: 0, blocks: [], shiftStart: 0, bars: [], beams: [] };
+    this.measure = { g, number: Math.floor(block.measureNumber + 1e-6), line: -1, offset: 0, width: 0,
+                     blocks: [], shiftStart: 0, bars: [], beams: [] };
   }
 
   /**
@@ -808,13 +840,13 @@ export class JianpuSVGRender {
       const at = (x: number) => shift(m, x);
       for (const b of m.blocks) b.g.setAttribute('transform', `translate(${at(b.x)}, 0)`);
       for (const bar of m.bars) {
-        bar.el.setAttribute('transform', `translate(${bar.x + at(bar.x)}, 0) scale(1, ${this.barScaleY()})`);
+        bar.el.setAttribute('transform', `translate(${bar.x + at(bar.at ?? bar.x)}, 0) scale(1, ${this.barScaleY()})`);
       }
       for (const beam of m.beams) {
         this.drawBeamGroup(beam.group, beam.anchors.map((a) => ({ x: a.x + at(a.at), width: a.width })), m.g);
       }
     }
-    this.settle(k);
+    this.drawBarNumber(k, this.settle(k));
   }
 
   /**
@@ -825,8 +857,11 @@ export class JianpuSVGRender {
    * the next; a hairpin as a piece on each line, its ends as open as
    * LilyPond's are (see below).
    */
-  private settle(k: number): void {
-    const lineStart = this.leftMargin * 0.25;
+  private settle(k: number): SVGPathElement[] {
+    // A piece carried over from the line before starts where LilyPond's staff does:
+    // the bar number's right edge (see drawBarNumber).
+    const lineStart = this.staffStartX();
+    const incoming: SVGPathElement[] = [];
     // Where measure-relative x, moving with the block that starts at `at`, now is on its line.
     const onLine = (m: MeasureFrame, x: number, at: number) => m.offset + x + this.lines[m.line].shift!(m, at);
     this.pendingTies = this.pendingTies.filter((t) => {
@@ -840,7 +875,8 @@ export class JianpuSVGRender {
         this.drawTieSpan(t.from.g, t.from.xNoteRight, toOrigin + t.toX - fromOrigin);
       } else {
         this.drawTieSpan(t.from.g, t.from.xNoteRight, this.lines[a.line].end! - 1 - fromOrigin);
-        this.drawTieSpan(t.toG, lineStart - toOrigin, t.toX);
+        const arc = this.drawTieSpan(t.toG, lineStart - toOrigin, t.toX);
+        if (arc) incoming.push(arc);
       }
       return false;
     });
@@ -873,6 +909,78 @@ export class JianpuSVGRender {
       });
       return false;
     });
+    return incoming;
+  }
+
+  /** Fork: where LilyPond's staff begins on a wrapped line: 2 staff spaces before its first note. */
+  private staffStartX(): number {
+    return this.lineStartX - 2 * this.staffSpace;
+  }
+
+  /**
+   * Fork: the room a wrapped line keeps before its first note for the bar
+   * number: the widest number this score prints, and the 2 staff spaces that
+   * LilyPond leaves between the staff's left edge -- where the number ends --
+   * and the first note. The PDF hangs the number in the page margin; here
+   * the left edge of the SVG is that margin. At least the old left margin,
+   * which holds the first note's accidental.
+   */
+  private barNumberGutter(): number {
+    let last = 1;
+    this.jianpuModel.jianpuBlockMap.forEach((b) => { last = Math.max(last, Math.floor(b.measureNumber + 1e-6)); });
+    const widest = String(printedBarNumber(last, !!this.jianpuInfo.anacrusis));
+    const probe = drawSVGText(this.musicG, widest, 0, 0, `${this.barNumberFontSize()}px`, 'normal', 'end',
+                              'middle', this.config.noteColor, 1, this.config.fontFamily);
+    let width = 0;
+    try {
+      width = measureSVGTextWidth(probe, widest, `${this.barNumberFontSize()}px`);
+    } catch (e) {
+      width = 0;   // not rendered: estimate below
+    }
+    probe.remove();
+    if (!(width > 0)) width = widest.length * 0.556 * this.barNumberFontSize();
+    return Math.max(this.leftMargin, Math.ceil(width) + 1 + 2 * this.staffSpace);
+  }
+
+  /** Fork: LilyPond's BarNumber is `font-size -2`: 2^(-2/6) of the digits' size. */
+  private barNumberFontSize(): number {
+    return this.numberFontSize * Math.pow(2, -1 / 3);
+  }
+
+  /**
+   * Fork: the bar number at the start of line `k`, as LilyPond prints it by
+   * default: on every line but the first, its right edge at the staff's left
+   * edge, its baseline 0.693 digit sizes above the digits' (PDF: 7.6 pt over
+   * 11 pt digits) -- about level with the digits' tops. A tie coming in from
+   * the line before starts right where the number ends; LilyPond then lifts
+   * the number to sit at the arc's top (PDF: its baseline 0.15 staff spaces
+   * below the arc's top, where it would otherwise cut through the arc).
+   * Digits here sit on the middle of their em box (dominant-baseline middle),
+   * whose baseline is about 0.26 em lower; the number is placed the same way,
+   * so only the difference in size enters.
+   */
+  private drawBarNumber(k: number, incoming: SVGPathElement[]): void {
+    const line = this.lines[k];
+    if (k === 0 || !line.measures.length) return;
+    const n = printedBarNumber(line.measures[0].number, !!this.jianpuInfo.anacrusis);
+    const size = this.barNumberFontSize();
+    const middleToBaseline = 0.26;
+    const nf = this.numberFontSize;
+    let y = nf * middleToBaseline - nf * 0.693 - size * middleToBaseline;
+    for (const arc of incoming) {
+      let top: number;
+      try {
+        const box = arc.getBBox();
+        // the arc's own transform: translate(x, y) scale(sx, sy), y and sy as drawTieSpan gives them
+        top = -this.config.noteHeight * 1.2 + box.y * (this.config.noteHeight / PATH_SCALE) * 1.6;
+      } catch (e) {
+        continue;   // not rendered
+      }
+      y = Math.min(y, top + 0.15 * this.staffSpace - size * middleToBaseline);
+    }
+    const text = drawSVGText(line.g, `${n}`, this.staffStartX(), y, `${size}px`, 'normal', 'end', 'middle',
+                             this.config.noteColor, 1, this.config.fontFamily);
+    text.setAttribute('data-bar-number', `${n}`);
   }
 
   /**
@@ -1043,6 +1151,7 @@ export class JianpuSVGRender {
             // whose staff space is 5 pt; ours are numberFontSize px.
             this.staffSpace = this.numberFontSize * 5 / 11;
             this.shortestQ = this.commonShortest();
+            if (!this.lines.length) this.lineStartX = this.barNumberGutter();
         }
 
         let blockIndex = 0;
@@ -1304,7 +1413,8 @@ export class JianpuSVGRender {
         const isFinalBlock = this.jianpuModel.isLastMeasureAtQ(block.start + block.length);
         if (isFinalBlock) {
             const barX = x + blockWidth + (this.measure ? LINE_STROKE_WIDTH / 2 : 0);
-            this.recordBar(this.drawBarLine(this.target(), barX), barX, true);
+            if (this.measure) this.drawFinalBarLine(this.target(), barX);   // fork: wrapped, as the PDF ends
+            else this.recordBar(this.drawBarLine(this.target(), barX), barX, true);
             if (isCompact) {
                 blockWidth += LINE_STROKE_WIDTH;
             }
